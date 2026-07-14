@@ -1,0 +1,6 @@
+{
+  "name": "Bybit Gold Trading Terminal",
+  "description": "An automated trading terminal for gold and other assets on Bybit, driven by custom logic triggered from TradingView webhooks with real-time logging and execution monitoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

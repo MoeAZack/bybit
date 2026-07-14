@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+@keyframes logFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(-6px);
+    border-color: rgba(245, 158, 11, 0.4);
+    background-color: rgba(245, 158, 11, 0.08);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-log-fade-in {
+  animation: logFadeIn 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
