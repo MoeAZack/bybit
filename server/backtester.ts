@@ -1,4 +1,163 @@
-import { ClosedTrade } from './db.js';
+import { ClosedTrade, getContractMultiplier } from './db.js';
+import { BybitClient } from './bybit.js';
+
+function calculateEMA(prices: number[], period: number): number[] {
+  const ema: number[] = [];
+  if (prices.length === 0) return ema;
+  const k = 2 / (period + 1);
+  let currentEma = prices[0];
+  ema.push(currentEma);
+  for (let i = 1; i < prices.length; i++) {
+    currentEma = prices[i] * k + currentEma * (1 - k);
+    ema.push(currentEma);
+  }
+  return ema;
+}
+
+function calculateRSI(prices: number[], period: number): number[] {
+  const rsi: number[] = [];
+  if (prices.length < 2) {
+    return new Array(prices.length).fill(50);
+  }
+  let gains = 0;
+  let losses = 0;
+
+  const initialPeriod = Math.min(period, prices.length - 1);
+  for (let i = 1; i <= initialPeriod; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+
+  let avgGain = gains / (initialPeriod || 1);
+  let avgLoss = losses / (initialPeriod || 1);
+  
+  for (let i = 0; i <= initialPeriod; i++) {
+    rsi.push(50);
+  }
+
+  for (let i = initialPeriod + 1; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    let gain = diff > 0 ? diff : 0;
+    let loss = diff < 0 ? -diff : 0;
+
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+
+    const rs = avgLoss > 0 ? avgGain / avgLoss : 0;
+    const rsiVal = avgLoss === 0 ? 100 : 100 - (100 / (1 + rs));
+    rsi.push(rsiVal);
+  }
+  
+  while (rsi.length < prices.length) {
+    rsi.push(50);
+  }
+  return rsi;
+}
+
+function calculateATR(highs: number[], lows: number[], closes: number[], period: number): number[] {
+  const atr: number[] = [];
+  if (highs.length === 0) return atr;
+  
+  const tr: number[] = [highs[0] - lows[0]];
+  for (let i = 1; i < highs.length; i++) {
+    const tr1 = highs[i] - lows[i];
+    const tr2 = Math.abs(highs[i] - closes[i - 1]);
+    const tr3 = Math.abs(lows[i] - closes[i - 1]);
+    tr.push(Math.max(tr1, tr2, tr3));
+  }
+
+  let currentAtr = tr[0];
+  atr.push(currentAtr);
+  
+  for (let i = 1; i < tr.length; i++) {
+    currentAtr = (currentAtr * (period - 1) + tr[i]) / period;
+    atr.push(currentAtr);
+  }
+  return atr;
+}
+
+function calculateADXArray(highs: number[], lows: number[], closes: number[], period: number): number[] {
+  const adxArray: number[] = new Array(highs.length).fill(22);
+  if (highs.length < period * 2) {
+    return adxArray;
+  }
+
+  const tr: number[] = [];
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
+
+  for (let i = 1; i < highs.length; i++) {
+    const curHigh = highs[i];
+    const curLow = lows[i];
+    const prevClose = closes[i - 1];
+    const prevHigh = highs[i - 1];
+    const prevLow = lows[i - 1];
+
+    const tr1 = curHigh - curLow;
+    const tr2 = Math.abs(curHigh - prevClose);
+    const tr3 = Math.abs(curLow - prevClose);
+    tr.push(Math.max(tr1, tr2, tr3));
+
+    const upMove = curHigh - prevHigh;
+    const downMove = prevLow - curLow;
+
+    let dmPlus = 0;
+    let dmMinus = 0;
+
+    if (upMove > downMove && upMove > 0) {
+      dmPlus = upMove;
+    }
+    if (downMove > upMove && downMove > 0) {
+      dmMinus = downMove;
+    }
+
+    plusDM.push(dmPlus);
+    minusDM.push(dmMinus);
+  }
+
+  let smoothedTR = 0;
+  let smoothedPlusDM = 0;
+  let smoothedMinusDM = 0;
+
+  for (let i = 0; i < period; i++) {
+    smoothedTR += tr[i];
+    smoothedPlusDM += plusDM[i];
+    smoothedMinusDM += minusDM[i];
+  }
+
+  const dxValues: number[] = new Array(period).fill(0);
+
+  for (let i = period; i < tr.length; i++) {
+    smoothedTR = smoothedTR - (smoothedTR / period) + tr[i];
+    smoothedPlusDM = smoothedPlusDM - (smoothedPlusDM / period) + plusDM[i];
+    smoothedMinusDM = smoothedMinusDM - (smoothedMinusDM / period) + minusDM[i];
+
+    const plusDI = smoothedTR > 0 ? (smoothedPlusDM / smoothedTR) * 100 : 0;
+    const minusDI = smoothedTR > 0 ? (smoothedMinusDM / smoothedTR) * 100 : 0;
+
+    const diDiff = Math.abs(plusDI - minusDI);
+    const diSum = plusDI + minusDI;
+    const dx = diSum > 0 ? (diDiff / diSum) * 100 : 0;
+    dxValues.push(dx);
+  }
+
+  let adx = 0;
+  for (let i = 0; i < period; i++) {
+    adx += dxValues[i];
+  }
+  adx = adx / period;
+  adxArray[period] = adx;
+
+  for (let i = period; i < dxValues.length; i++) {
+    adx = ((adx * (period - 1)) + dxValues[i]) / period;
+    if (i + 1 < adxArray.length) {
+      adxArray[i + 1] = adx;
+    }
+  }
+
+  return adxArray;
+}
 
 export interface BacktestResult {
   totalTrades: number;
@@ -63,6 +222,7 @@ export interface StrategyParams {
   isPartialTPActive?: boolean;
   isTimeStopActive?: boolean;
   timeStopBars?: number;
+  symbol?: string;
 }
 
 // Generates highly realistic XAUUSDT price series with simulated indicators including ADX
@@ -148,7 +308,12 @@ function generateSyntheticKlines(startDate: Date, endDate: Date, timeframeMins: 
 }
 
 export class Backtester {
-  public static run(params: StrategyParams): BacktestResult {
+  public static calculateADX(highs: number[], lows: number[], closes: number[], period: number = 14): number {
+    const arr = calculateADXArray(highs, lows, closes, period);
+    return arr[arr.length - 1];
+  }
+
+  public static async run(params: StrategyParams): Promise<BacktestResult> {
     // Determine backtest time window
     let startDate = new Date('2026-01-01T00:00:00Z');
     let endDate = new Date('2026-06-30T23:59:59Z');
@@ -162,7 +327,66 @@ export class Backtester {
     }
 
     const timeframeMins = 15; // standard TrendForge 15-minute chart
-    const klines = generateSyntheticKlines(startDate, endDate, timeframeMins);
+    let klines: {
+      time: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      rsi: number;
+      atr: number;
+      emaFast: number;
+      emaSlow: number;
+      adx: number;
+    }[] = [];
+
+    let fetchedReal = false;
+    try {
+      const client = new BybitClient({ apiKey: '', apiSecret: '' });
+      const symbol = params.symbol || 'XAUUSDT';
+      const rawKlines = await client.getKlines({
+        symbol,
+        interval: '15',
+        limit: 1000,
+      });
+
+      if (rawKlines && rawKlines.length > 28) {
+        const chronologicalKlines = [...rawKlines].reverse();
+        const highs = chronologicalKlines.map(k => parseFloat(k[2]));
+        const lows = chronologicalKlines.map(k => parseFloat(k[3]));
+        const closes = chronologicalKlines.map(k => parseFloat(k[4]));
+
+        const emaFastArray = calculateEMA(closes, params.fastEma);
+        const emaSlowArray = calculateEMA(closes, params.slowEma);
+        const rsiArray = calculateRSI(closes, params.rsiPeriod);
+        const atrArray = calculateATR(highs, lows, closes, params.atrPeriod);
+        const adxArray = calculateADXArray(highs, lows, closes, 14);
+
+        for (let i = 0; i < chronologicalKlines.length; i++) {
+          const k = chronologicalKlines[i];
+          klines.push({
+            time: new Date(Number(k[0])),
+            open: parseFloat(k[1]),
+            high: highs[i],
+            low: lows[i],
+            close: closes[i],
+            rsi: rsiArray[i] || 50,
+            atr: atrArray[i] || 3.5,
+            emaFast: emaFastArray[i] || closes[i],
+            emaSlow: emaSlowArray[i] || closes[i],
+            adx: adxArray[i] || 22,
+          });
+        }
+        fetchedReal = true;
+        console.log(`[Backtester] Successfully ran backtest using ${klines.length} real market candles.`);
+      }
+    } catch (err: any) {
+      console.warn(`[Backtester] Failed to run with real candles: ${err.message || err}. Falling back to synthetic candles.`);
+    }
+
+    if (!fetchedReal) {
+      klines = generateSyntheticKlines(startDate, endDate, timeframeMins);
+    }
 
     let balance = 10000.0;
     const initialBalance = balance;
@@ -233,10 +457,11 @@ export class Backtester {
         const pos = currentPosition;
         
         const sideMultiplier = pos.type === 'LONG' ? 1 : -1;
-        const grossPnL = sideMultiplier * (exitPrice - pos.entryPrice) * pos.quantity * 10;
+        const mult = getContractMultiplier(params.symbol);
+        const grossPnL = sideMultiplier * (exitPrice - pos.entryPrice) * pos.quantity * mult;
         
-        const entryValue = pos.entryPrice * pos.quantity * 10;
-        const exitValue = exitPrice * pos.quantity * 10;
+        const entryValue = pos.entryPrice * pos.quantity * mult;
+        const exitValue = exitPrice * pos.quantity * mult;
         const effectiveFeePercent = params.feePercent / 100;
         const totalFees = (entryValue + exitValue) * effectiveFeePercent;
         
@@ -252,7 +477,7 @@ export class Backtester {
         const dd = ((maxBalance - balance) / maxBalance) * 100;
         if (dd > maxDrawdown) maxDrawdown = dd;
 
-        const initialDollarRisk = pos.initialRiskPriceDiff * pos.initialQty * 10;
+        const initialDollarRisk = pos.initialRiskPriceDiff * pos.initialQty * getContractMultiplier(params.symbol);
         const riskAmountR = initialDollarRisk > 0 ? (finalPnL / initialDollarRisk) : 0;
 
         trades.push({
@@ -298,9 +523,10 @@ export class Backtester {
             // Close half position
             const partialQty = pos.quantity * 0.5;
             const sideMultiplier = pos.type === 'LONG' ? 1 : -1;
-            const grossPnL = sideMultiplier * (exitPrice - pos.entryPrice) * partialQty * 10;
-            const entryValue = pos.entryPrice * partialQty * 10;
-            const exitValue = exitPrice * partialQty * 10;
+            const mult = getContractMultiplier(params.symbol);
+            const grossPnL = sideMultiplier * (exitPrice - pos.entryPrice) * partialQty * mult;
+            const entryValue = pos.entryPrice * partialQty * mult;
+            const exitValue = exitPrice * partialQty * mult;
             const effectiveFeePercent = params.feePercent / 100;
             const totalFees = (entryValue + exitValue) * effectiveFeePercent;
             
@@ -316,7 +542,7 @@ export class Backtester {
             const dd = ((maxBalance - balance) / maxBalance) * 100;
             if (dd > maxDrawdown) maxDrawdown = dd;
 
-            const initialDollarRisk = pos.initialRiskPriceDiff * pos.initialQty * 10;
+            const initialDollarRisk = pos.initialRiskPriceDiff * pos.initialQty * getContractMultiplier(params.symbol);
             const riskAmountR = initialDollarRisk > 0 ? (finalPnL / initialDollarRisk) : 0;
 
             trades.push({
@@ -390,11 +616,12 @@ export class Backtester {
           // Compute gross PnL
           const sideMultiplier = pos.type === 'LONG' ? 1 : -1;
           const priceDiff = exitPrice - pos.entryPrice;
-          const grossPnL = sideMultiplier * priceDiff * pos.quantity * 10;
+          const mult = getContractMultiplier(params.symbol);
+          const grossPnL = sideMultiplier * priceDiff * pos.quantity * mult;
 
           // Fees modeling (Maker vs Taker)
-          const entryValue = pos.entryPrice * pos.quantity * 10;
-          const exitValue = exitPrice * pos.quantity * 10;
+          const entryValue = pos.entryPrice * pos.quantity * mult;
+          const exitValue = exitPrice * pos.quantity * mult;
           const rate = params.orderType === 'LIMIT_POST_ONLY' ? 0.02 : (params.feePercent / 100);
           const totalFees = (entryValue + exitValue) * rate;
 
@@ -415,7 +642,7 @@ export class Backtester {
           }
 
           // Compute R multiplier relative to initial position setup
-          const initialDollarRisk = pos.initialRiskPriceDiff * pos.initialQty * 10;
+          const initialDollarRisk = pos.initialRiskPriceDiff * pos.initialQty * getContractMultiplier(params.symbol);
           const riskAmountR = initialDollarRisk > 0 ? (finalPnL / initialDollarRisk) : 0;
 
           trades.push({

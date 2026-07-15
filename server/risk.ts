@@ -1,6 +1,7 @@
-import { Database, TradingSettings } from './db';
+import { Database, TradingSettings, getContractMultiplier } from './db';
 import { BybitClient } from './bybit';
 import { MT5Client } from './mt5';
+import { getBridgeStatus, enqueueMt5Command } from './mt5bridge.js';
 
 export interface RiskCheckResult {
   allowed: boolean;
@@ -107,6 +108,7 @@ export class CentralRiskManager {
     } else {
       // Live Trading: Fetch actual ticker bid-ask from Bybit or MT5 depending on active broker
       try {
+        let fetched = false;
         if (settings.activeBroker === 'mt5') {
           if (settings.mt5Login && settings.mt5Password) {
             const client = new MT5Client({
@@ -118,6 +120,7 @@ export class CentralRiskManager {
             const ticker = await client.getTicker(symbol);
             // Simulating typical bid/ask from MT5 ticker response if available, or random spread
             spread = 0.22 + Math.random() * 0.15;
+            fetched = true;
           }
         } else if (settings.bybitApiKey && settings.bybitApiSecret) {
           const client = new BybitClient({
@@ -131,10 +134,18 @@ export class CentralRiskManager {
           const ask = Number(rawTicker?.ask1Price || rawTicker?.askPrice || ticker.lastPrice);
           if (bid > 0 && ask > 0) {
             spread = ask - bid;
+            fetched = true;
           }
         }
-      } catch (e) {
-        console.error('Failed to fetch real orderbook spread, using default paper spread:', e);
+        if (!fetched) {
+          throw new Error('Broker API key or MT5 credentials are not configured.');
+        }
+      } catch (e: any) {
+        console.error('Failed to fetch real orderbook spread, vetoing execution:', e);
+        return {
+          allowed: false,
+          reason: `VETO (Slippage Gate): Failed to fetch real-time bid-ask spread from broker (${e.message || e}). Entry blocked for safety.`,
+        };
       }
     }
 
@@ -213,7 +224,7 @@ export class CentralRiskManager {
   /**
    * Simulates/Updates active paper positions: manages SL/TP triggers, breakeven moves, and trailing stops
    */
-  public static updatePaperPositions(db: any, livePrice: number): { triggers: string[] } {
+  public static updatePaperPositions(db: any, livePrice: number, pricesMap?: Record<string, number>): { triggers: string[] } {
     const settings = db.settings;
     const positions = db.paperAccount.positions || [];
     const triggers: string[] = [];
@@ -225,7 +236,15 @@ export class CentralRiskManager {
       let triggerPnl = 0;
 
       const sideFactor = pos.side === 'buy' ? 1 : -1;
-      const currentPrice = livePrice;
+      let currentPrice = livePrice;
+      if (pricesMap && pricesMap[pos.symbol] !== undefined) {
+        currentPrice = pricesMap[pos.symbol];
+      } else if (pricesMap) {
+        const altSymbol = pos.symbol === 'XAUUSD' ? 'XAUUSDT' : (pos.symbol === 'XAUUSDT' ? 'XAUUSD' : pos.symbol);
+        if (pricesMap[altSymbol] !== undefined) {
+          currentPrice = pricesMap[altSymbol];
+        }
+      }
 
       // 1. Check Trailing Stop / Breakeven
       if (settings.isTrailingStopActive && pos.stopLossPrice) {
@@ -267,7 +286,7 @@ export class CentralRiskManager {
         if (slBreached) {
           isTriggered = true;
           triggerMsg = `[Stop Loss Triggered] Paper ${pos.side.toUpperCase()} position stopped out at $${pos.stopLossPrice.toFixed(2)} (Entry: $${pos.entryPrice.toFixed(2)}).`;
-          triggerPnl = sideFactor * (pos.stopLossPrice - pos.entryPrice) * pos.quantity * 10;
+          triggerPnl = sideFactor * (pos.stopLossPrice - pos.entryPrice) * pos.quantity * getContractMultiplier(pos.symbol);
         }
       }
 
@@ -280,7 +299,7 @@ export class CentralRiskManager {
         if (tpBreached) {
           isTriggered = true;
           triggerMsg = `[Take Profit Triggered] Paper ${pos.side.toUpperCase()} position hit profit target at $${pos.takeProfitPrice.toFixed(2)} (Entry: $${pos.entryPrice.toFixed(2)}).`;
-          triggerPnl = sideFactor * (pos.takeProfitPrice - pos.entryPrice) * pos.quantity * 10;
+          triggerPnl = sideFactor * (pos.takeProfitPrice - pos.entryPrice) * pos.quantity * getContractMultiplier(pos.symbol);
         }
       }
 
@@ -413,9 +432,69 @@ export class CentralRiskManager {
     }
 
     // 3. Central Max Position Size Veto
-    const activePositions = settings.isPaperTrading 
-      ? db.paperAccount.positions 
-      : []; // If live, we can fetch later or keep local tracking
+    let activePositions: any[] = [];
+    let equity = 10000;
+
+    if (settings.isPaperTrading) {
+      activePositions = db.paperAccount.positions || [];
+      equity = db.paperAccount.balance;
+    } else {
+      try {
+        if (settings.activeBroker === 'bybit' && settings.bybitApiKey && settings.bybitApiSecret) {
+          const client = new BybitClient({
+            apiKey: settings.bybitApiKey,
+            apiSecret: settings.bybitApiSecret,
+            environment: settings.bybitEnvironment,
+          });
+          const bal = await client.getWalletBalance();
+          equity = bal.balance;
+
+          const rawPositions = await client.getPositions();
+          activePositions = rawPositions
+            .filter((p: any) => parseFloat(p.size || p.qty || '0') > 0)
+            .map(p => ({
+              symbol: p.symbol,
+              quantity: parseFloat(p.size || p.qty),
+              side: p.side.toLowerCase() as 'buy' | 'sell',
+              entryPrice: parseFloat(p.entryPrice),
+              stopLossPrice: parseFloat(p.stopLoss || '0'),
+            }));
+        } else if (settings.activeBroker === 'mt5' && settings.mt5Login && settings.mt5Password) {
+          const client = new MT5Client({
+            host: settings.mt5Host,
+            login: settings.mt5Login,
+            password: settings.mt5Password,
+            server: settings.mt5Server,
+            gatewayType: settings.mt5GatewayType,
+            gatewayUrl: settings.mt5GatewayUrl,
+            gatewayToken: settings.mt5GatewayToken,
+          });
+          const wallet = await client.getWalletBalance();
+          equity = wallet.equity || wallet.balance;
+
+          const rawPositions = await client.getPositions();
+          activePositions = rawPositions
+            .filter((p: any) => parseFloat(p.volume || p.qty || p.size || '0') > 0)
+            .map(p => ({
+              symbol: p.symbol,
+              quantity: parseFloat(p.volume || p.qty || p.size),
+              side: (p.type || p.side || 'Buy').toLowerCase().includes('sell') ? 'sell' : 'buy',
+              entryPrice: parseFloat(p.openPrice || p.price || p.entryPrice),
+              stopLossPrice: parseFloat(p.sl || '0'),
+            }));
+        } else {
+          return {
+            allowed: false,
+            reason: 'VETO (Live Account Risk): Live broker API configuration missing.'
+          };
+        }
+      } catch (e: any) {
+        return {
+          allowed: false,
+          reason: `VETO (Live Account Risk Check Failed): Unable to fetch live account details: ${e.message || e}. Entry blocked to prevent trading under unknown risk status.`
+        };
+      }
+    }
 
     const existingPos = activePositions.find(p => p.symbol.toUpperCase() === symbol.toUpperCase());
     const currentQty = existingPos ? existingPos.quantity : 0;
@@ -464,26 +543,6 @@ export class CentralRiskManager {
 
     // 6. Centralized Portfolio Risk Rule Veto (3% Combined Risk Rule)
     if (settings.isCentralRiskVetoActive) {
-      // Get account balance/equity
-      let equity = 10000;
-      if (settings.isPaperTrading) {
-        equity = db.paperAccount.balance;
-      } else {
-        try {
-          if (settings.bybitApiKey && settings.bybitApiSecret) {
-            const client = new BybitClient({
-              apiKey: settings.bybitApiKey,
-              apiSecret: settings.bybitApiSecret,
-              isTestnet: settings.isTestnet,
-            });
-            const bal = await client.getWalletBalance();
-            equity = bal.balance;
-          }
-        } catch (e) {
-          console.error('Failed to fetch Bybit balance for central risk check, falling back to $10,000:', e);
-        }
-      }
-
       // Max allowed portfolio risk in dollars
       const maxRiskDollars = (equity * settings.maxPortfolioRiskPercent) / 100;
 
@@ -501,20 +560,18 @@ export class CentralRiskManager {
         slDistance = Math.abs(price - stops.stopLossPrice);
       }
       
-      // Expected trade risk = Quantity * StopLossDistance
-      const tradeRisk = adjustedQty * slDistance * 10;
+      // Expected trade risk = Quantity * StopLossDistance * Multiplier
+      const tradeRisk = adjustedQty * slDistance * getContractMultiplier(symbol);
 
       // Calculate existing open positions risk
       let currentOpenRisk = 0;
-      if (settings.isPaperTrading) {
-        activePositions.forEach(pos => {
-          let posSlDistance = pos.entryPrice * (settings.stopLossPercent / 100);
-          if (pos.stopLossPrice) {
-            posSlDistance = Math.abs(pos.entryPrice - pos.stopLossPrice);
-          }
-          currentOpenRisk += pos.quantity * posSlDistance * 10;
-        });
-      }
+      activePositions.forEach(pos => {
+        let posSlDistance = pos.entryPrice * (settings.stopLossPercent / 100);
+        if (pos.stopLossPrice) {
+          posSlDistance = Math.abs(pos.entryPrice - pos.stopLossPrice);
+        }
+        currentOpenRisk += pos.quantity * posSlDistance * getContractMultiplier(pos.symbol);
+      });
 
       const totalProjectedRisk = currentOpenRisk + tradeRisk;
 
@@ -529,7 +586,7 @@ export class CentralRiskManager {
         }
 
         // Downscale quantity to fit within risk budget
-        const recommendedQty = Math.floor((targetSingleTradeRisk / (slDistance * 10)) * 100) / 100;
+        const recommendedQty = Math.floor((targetSingleTradeRisk / (slDistance * getContractMultiplier(symbol))) * 100) / 100;
         if (recommendedQty < 0.01) {
           return {
             allowed: false,
@@ -554,5 +611,138 @@ export class CentralRiskManager {
     }
 
     return { allowed: true };
+  }
+
+  /**
+   * Updates live positions: checks trailing stops or breakeven and modifies them on the broker/bridge
+   */
+  public static async updateLivePositions(db: any, livePrice: number): Promise<string[]> {
+    const settings = db.settings;
+    if (settings.isPaperTrading) return [];
+
+    const triggers: string[] = [];
+    const symbol = settings.defaultSymbol || 'XAUUSDT';
+
+    try {
+      if (settings.activeBroker === 'bybit' && settings.bybitApiKey && settings.bybitApiSecret) {
+        const client = new BybitClient({
+          apiKey: settings.bybitApiKey,
+          apiSecret: settings.bybitApiSecret,
+          environment: settings.bybitEnvironment,
+        });
+        const positions = await client.getPositions(symbol);
+        const activePos = positions.find((p: any) => parseFloat(p.size || p.qty || '0') > 0);
+
+        if (activePos && settings.isTrailingStopActive) {
+          const entryPrice = parseFloat(activePos.entryPrice);
+          const currentSl = parseFloat(activePos.stopLoss || '0');
+          const side = activePos.side.toLowerCase() as 'buy' | 'sell';
+          
+          const slPercent = settings.isHybridStopsActive ? settings.stopLossPercent : 1.5;
+          const slDistance = entryPrice * (slPercent / 100);
+          const breakevenThreshold = slDistance * (settings.breakevenMultiplier || 1.0);
+
+          if (side === 'buy') {
+            const runInFavor = livePrice - entryPrice;
+            if (runInFavor >= breakevenThreshold && currentSl < entryPrice) {
+              await client.setTradingStop({ symbol, stopLoss: entryPrice.toFixed(2) });
+              triggers.push(`[Live Breakeven] Bybit LONG SL moved to Breakeven ($${entryPrice.toFixed(2)})`);
+            } else if (settings.isDynamicSlActive && runInFavor > 0) {
+              const newSl = Number((livePrice - slDistance).toFixed(2));
+              if (newSl > currentSl && newSl < livePrice) {
+                await client.setTradingStop({ symbol, stopLoss: newSl.toFixed(2) });
+              }
+            }
+          } else {
+            const runInFavor = entryPrice - livePrice;
+            if (runInFavor >= breakevenThreshold && (currentSl === 0 || currentSl > entryPrice)) {
+              await client.setTradingStop({ symbol, stopLoss: entryPrice.toFixed(2) });
+              triggers.push(`[Live Breakeven] Bybit SHORT SL moved to Breakeven ($${entryPrice.toFixed(2)})`);
+            } else if (settings.isDynamicSlActive && runInFavor > 0) {
+              const newSl = Number((livePrice + slDistance).toFixed(2));
+              if ((currentSl === 0 || newSl < currentSl) && newSl > livePrice) {
+                await client.setTradingStop({ symbol, stopLoss: newSl.toFixed(2) });
+              }
+            }
+          }
+        }
+      } else if (settings.activeBroker === 'mt5') {
+        const bridge = getBridgeStatus();
+        if (bridge.connected && settings.isTrailingStopActive) {
+          let mt5Symbol = symbol;
+          if (symbol === 'XAUUSDT') mt5Symbol = 'XAUUSD';
+
+          const activePos = bridge.positions.find((p: any) => p.symbol === mt5Symbol);
+
+          if (activePos) {
+            const ticket = activePos.ticket;
+            const side = activePos.side; // 'buy' or 'sell'
+            const entryPrice = activePos.entry;
+            const currentSl = activePos.sl;
+
+            const slPercent = settings.isHybridStopsActive ? settings.stopLossPercent : 1.5;
+            const slDistance = entryPrice * (slPercent / 100);
+            const breakevenThreshold = slDistance * (settings.breakevenMultiplier || 1.0);
+
+            if (side === 'buy') {
+              const runInFavor = livePrice - entryPrice;
+              if (runInFavor >= breakevenThreshold && currentSl < entryPrice) {
+                enqueueMt5Command({
+                  action: 'MODIFY',
+                  symbol: mt5Symbol,
+                  sl: entryPrice,
+                  tp: activePos.tp,
+                  comment: `BE-${ticket}`,
+                  idempotencyKey: `BE-${ticket}-${entryPrice.toFixed(2)}`,
+                });
+                triggers.push(`[Live Breakeven Queued] MT5 LONG (Ticket ${ticket}) SL move to Breakeven ($${entryPrice.toFixed(2)})`);
+              } else if (settings.isDynamicSlActive && runInFavor > 0) {
+                const newSl = Number((livePrice - slDistance).toFixed(2));
+                if (newSl > currentSl && newSl < livePrice) {
+                  enqueueMt5Command({
+                    action: 'MODIFY',
+                    symbol: mt5Symbol,
+                    sl: newSl,
+                    tp: activePos.tp,
+                    comment: `TS-${ticket}`,
+                    idempotencyKey: `TS-${ticket}-${newSl.toFixed(2)}`,
+                  });
+                }
+              }
+            } else {
+              const runInFavor = entryPrice - livePrice;
+              if (runInFavor >= breakevenThreshold && (currentSl === 0 || currentSl > entryPrice)) {
+                enqueueMt5Command({
+                  action: 'MODIFY',
+                  symbol: mt5Symbol,
+                  sl: entryPrice,
+                  tp: activePos.tp,
+                  comment: `BE-${ticket}`,
+                  idempotencyKey: `BE-${ticket}-${entryPrice.toFixed(2)}`,
+                });
+                triggers.push(`[Live Breakeven Queued] MT5 SHORT (Ticket ${ticket}) SL move to Breakeven ($${entryPrice.toFixed(2)})`);
+              } else if (settings.isDynamicSlActive && runInFavor > 0) {
+                const newSl = Number((livePrice + slDistance).toFixed(2));
+                if ((currentSl === 0 || newSl < currentSl) && newSl > livePrice) {
+                  enqueueMt5Command({
+                    action: 'MODIFY',
+                    symbol: mt5Symbol,
+                    sl: newSl,
+                    tp: activePos.tp,
+                    comment: `TS-${ticket}`,
+                    idempotencyKey: `TS-${ticket}-${newSl.toFixed(2)}`,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      const errMsg = e.message || String(e);
+      console.warn(`[CentralRiskManager] Failed to update live positions trailing/breakeven stops: ${errMsg}`);
+    }
+
+    return triggers;
   }
 }

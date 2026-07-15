@@ -3,7 +3,8 @@ import crypto from 'crypto';
 export interface BybitConfig {
   apiKey: string;
   apiSecret: string;
-  isTestnet: boolean;
+  environment?: 'demo' | 'testnet' | 'live';
+  isTestnet?: boolean;
 }
 
 export class BybitClient {
@@ -15,9 +16,14 @@ export class BybitClient {
   constructor(config: BybitConfig) {
     this.apiKey = config.apiKey;
     this.apiSecret = config.apiSecret;
-    this.baseUrl = config.isTestnet
-      ? 'https://api-testnet.bybit.com'
-      : 'https://api.bybit.com';
+    const env = config.environment || (config.isTestnet ? 'testnet' : 'demo');
+    if (env === 'live') {
+      this.baseUrl = 'https://api.bybit.com';
+    } else if (env === 'testnet') {
+      this.baseUrl = 'https://api-testnet.bybit.com';
+    } else {
+      this.baseUrl = 'https://api-demo.bybit.com';
+    }
   }
 
   private generateSignature(timestamp: number, paramStr: string): string {
@@ -28,7 +34,9 @@ export class BybitClient {
   }
 
   private async request(method: 'GET' | 'POST', path: string, params: Record<string, any> = {}): Promise<any> {
-    if (!this.apiKey || !this.apiSecret) {
+    const isPublic = path.startsWith('/v5/market/');
+
+    if (!isPublic && (!this.apiKey || !this.apiSecret)) {
       throw new Error('Bybit API Key or Secret is missing in terminal configuration.');
     }
 
@@ -54,15 +62,17 @@ export class BybitClient {
       signatureStr = body;
     }
 
-    const signature = this.generateSignature(timestamp, signatureStr);
-
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'X-BAPI-API-KEY': this.apiKey,
-      'X-BAPI-TIMESTAMP': String(timestamp),
-      'X-BAPI-SIGN': signature,
-      'X-BAPI-RECV-WINDOW': String(this.recvWindow),
     };
+
+    if (!isPublic) {
+      const signature = this.generateSignature(timestamp, signatureStr);
+      headers['X-BAPI-API-KEY'] = this.apiKey;
+      headers['X-BAPI-TIMESTAMP'] = String(timestamp);
+      headers['X-BAPI-SIGN'] = signature;
+      headers['X-BAPI-RECV-WINDOW'] = String(this.recvWindow);
+    }
 
     try {
       const response = await fetch(url, {
@@ -85,7 +95,65 @@ export class BybitClient {
 
       return data.result;
     } catch (e: any) {
-      console.error(`Bybit client request to ${path} failed:`, e);
+      const errMsg = e.message || String(e);
+      console.warn(`Bybit client request to ${path} failed: ${errMsg}`);
+      throw e;
+    }
+  }
+
+  /**
+   * Fetch market klines (candles)
+   */
+  public async getKlines(params: {
+    symbol: string;
+    interval: string;
+    limit?: number;
+    start?: number;
+    end?: number;
+  }): Promise<any[]> {
+    try {
+      const queryParams: Record<string, any> = {
+        category: 'linear',
+        symbol: params.symbol,
+        interval: params.interval,
+        limit: params.limit || 200,
+      };
+      if (params.start) queryParams.start = params.start;
+      if (params.end) queryParams.end = params.end;
+
+      const result = await this.request('GET', '/v5/market/kline', queryParams);
+      return result?.list || [];
+    } catch (e: any) {
+      console.warn(`Failed to get Bybit klines for ${params.symbol}: ${e.message || String(e)}`);
+      throw e;
+    }
+  }
+
+  /**
+   * Modify Position Stop Loss and Take Profit
+   */
+  public async setTradingStop(params: {
+    symbol: string;
+    stopLoss?: string;
+    takeProfit?: string;
+  }): Promise<any> {
+    const stopParams: Record<string, any> = {
+      category: 'linear',
+      symbol: params.symbol,
+      positionIdx: 0,
+    };
+    if (params.stopLoss) {
+      stopParams.stopLoss = params.stopLoss;
+      stopParams.slTriggerBy = 'LastPrice';
+    }
+    if (params.takeProfit) {
+      stopParams.takeProfit = params.takeProfit;
+      stopParams.tpTriggerBy = 'LastPrice';
+    }
+    try {
+      return await this.request('POST', '/v5/position/set-trading-stop', stopParams);
+    } catch (e: any) {
+      console.warn(`Failed to update Bybit trading stop for ${params.symbol}: ${e.message || String(e)}`);
       throw e;
     }
   }
@@ -145,7 +213,7 @@ export class BybitClient {
       const result = await this.request('GET', '/v5/position/list', params);
       return result?.list || [];
     } catch (e: any) {
-      console.error('Failed to get Bybit positions:', e);
+      console.warn(`Failed to get Bybit positions: ${e.message || String(e)}`);
       throw e;
     }
   }
@@ -161,6 +229,8 @@ export class BybitClient {
     price?: string;
     stopLoss?: string;
     takeProfit?: string;
+    orderLinkId?: string;
+    reduceOnly?: boolean;
   }): Promise<any> {
     const orderParams: Record<string, any> = {
       category: 'linear',
@@ -186,10 +256,18 @@ export class BybitClient {
       orderParams.tpTriggerBy = 'LastPrice';
     }
 
+    if (params.orderLinkId) {
+      orderParams.orderLinkId = params.orderLinkId;
+    }
+
+    if (params.reduceOnly) {
+      orderParams.reduceOnly = true;
+    }
+
     try {
       return await this.request('POST', '/v5/order/create', orderParams);
     } catch (e: any) {
-      console.error('Failed to place Bybit order:', e);
+      console.warn(`Failed to place Bybit order: ${e.message || String(e)}`);
       throw e;
     }
   }
@@ -210,7 +288,7 @@ export class BybitClient {
         raw: result,
       };
     } catch (e: any) {
-      console.error(`Failed to get Bybit ticker for ${symbol}:`, e);
+      console.warn(`Failed to get Bybit ticker for ${symbol}: ${e.message || String(e)}`);
       throw e;
     }
   }

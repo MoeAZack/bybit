@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { Database } from './server/db.js';
 import { BybitClient } from './server/bybit.js';
@@ -8,6 +9,8 @@ import { Backtester } from './server/backtester.js';
 import { CentralRiskManager } from './server/risk.js';
 import { RegimeRouter } from './server/router.js';
 import { GoogleGenAI } from '@google/genai';
+import { mt5Queue } from './server/mt5Queue.js';
+import { registerMt5BridgeRoutes, enqueueMt5Command, getBridgeStatus } from './server/mt5bridge.js';
 
 const app = express();
 const PORT = 3000;
@@ -15,6 +18,9 @@ const PORT = 3000;
 // For parsing JSON and urlencoded request bodies
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Register outbound-only MT5 Bridge routes
+registerMt5BridgeRoutes(app);
 
 // Helper to initialize Gemini Client safely
 function getGeminiClient(): GoogleGenAI | null {
@@ -33,16 +39,58 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
+// REST API Security & IP Whitelist Enforcer Middleware
+function apiAuthMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+  // Exclude the TradingView webhook itself from API_AUTH_TOKEN header checks
+  if (req.path === '/tradingview-webhook') {
+    return next();
+  }
+
+  // Exclude same-origin requests (the frontend dashboard running on the same host)
+  const host = req.headers.host;
+  const referer = req.headers.referer;
+  const isSameOrigin = (req.headers['sec-fetch-site'] === 'same-origin') || 
+                       (referer && host && referer.includes(host));
+
+  if (isSameOrigin) {
+    return next();
+  }
+
+  const db = Database.get();
+  const whitelist = db.settings.ipWhitelist ? db.settings.ipWhitelist.trim() : '';
+  if (whitelist && whitelist !== '0.0.0.0 (Allow All)' && whitelist !== '0.0.0.0') {
+    const clientIp = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || '').split(',')[0].trim();
+    const allowedIps = whitelist.split(',').map(ip => ip.trim());
+    if (!allowedIps.includes(clientIp)) {
+      console.warn(`Blocked request from unauthorized IP: ${clientIp}. Whitelist: ${whitelist}`);
+      return res.status(403).json({ error: 'Forbidden: IP not in whitelist.' });
+    }
+  }
+
+  const expectedToken = process.env.API_AUTH_TOKEN;
+  if (expectedToken) {
+    const receivedToken = req.headers['authorization'] || req.headers['x-api-token'];
+    const tokenStr = String(receivedToken || '').replace(/^Bearer\s+/i, '').trim();
+    if (tokenStr !== expectedToken.trim()) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid API Auth Token.' });
+    }
+  }
+  next();
+}
+
 // REST API Endpoints
+app.use('/api', apiAuthMiddleware);
 
 // 1. Get Settings
 app.get('/api/settings', (req, res) => {
   try {
     const db = Database.get();
-    // Return settings (hide API Secret for security, just send a masked placeholder if set)
+    // Return settings (hide sensitive keys and passwords for security)
     const secureSettings = {
       ...db.settings,
+      bybitApiKey: db.settings.bybitApiKey ? '••••••••••••••••' : '',
       bybitApiSecret: db.settings.bybitApiSecret ? '••••••••••••••••' : '',
+      webhookPassphrase: db.settings.webhookPassphrase ? '••••••••••••••••' : '',
       mt5Password: db.settings.mt5Password ? '••••••••••••••••' : '',
       mt5GatewayToken: db.settings.mt5GatewayToken ? '••••••••••••••••' : '',
     };
@@ -59,6 +107,7 @@ app.post('/api/settings', (req, res) => {
       bybitApiKey,
       bybitApiSecret,
       isTestnet,
+      bybitEnvironment,
       isPaperTrading,
       webhookPassphrase,
       defaultSymbol,
@@ -84,17 +133,16 @@ app.post('/api/settings', (req, res) => {
       mt5Login,
       mt5Password,
       mt5Server,
-      mt5GatewayType,
-      mt5GatewayUrl,
-      mt5GatewayToken,
+      gatewayType,
+      gatewayUrl,
+      gatewayToken,
     } = req.body;
 
     const db = Database.get();
     const updated: Record<string, any> = {
-      bybitApiKey: bybitApiKey !== undefined ? bybitApiKey : db.settings.bybitApiKey,
       isTestnet: isTestnet !== undefined ? isTestnet : db.settings.isTestnet,
+      bybitEnvironment: bybitEnvironment !== undefined ? bybitEnvironment : db.settings.bybitEnvironment,
       isPaperTrading: isPaperTrading !== undefined ? isPaperTrading : db.settings.isPaperTrading,
-      webhookPassphrase: webhookPassphrase !== undefined ? webhookPassphrase : db.settings.webhookPassphrase,
       defaultSymbol: defaultSymbol !== undefined ? defaultSymbol : db.settings.defaultSymbol,
       defaultLeverage: defaultLeverage !== undefined ? Number(defaultLeverage) : db.settings.defaultLeverage,
       defaultOrderSize: defaultOrderSize !== undefined ? Number(defaultOrderSize) : db.settings.defaultOrderSize,
@@ -117,19 +165,41 @@ app.post('/api/settings', (req, res) => {
       mt5Host: mt5Host !== undefined ? mt5Host : db.settings.mt5Host,
       mt5Login: mt5Login !== undefined ? mt5Login : db.settings.mt5Login,
       mt5Server: mt5Server !== undefined ? mt5Server : db.settings.mt5Server,
-      mt5GatewayType: mt5GatewayType !== undefined ? mt5GatewayType : db.settings.mt5GatewayType,
-      mt5GatewayUrl: mt5GatewayUrl !== undefined ? mt5GatewayUrl : db.settings.mt5GatewayUrl,
+      mt5GatewayType: gatewayType !== undefined ? gatewayType : (req.body.mt5GatewayType !== undefined ? req.body.mt5GatewayType : db.settings.mt5GatewayType),
+      mt5GatewayUrl: gatewayUrl !== undefined ? gatewayUrl : (req.body.mt5GatewayUrl !== undefined ? req.body.mt5GatewayUrl : db.settings.mt5GatewayUrl),
     };
 
-    // If API Secret is updated and is not the masked placeholder, save it
+    // Robust masking protection: Only overwrite with new input if it is not a masked placeholder
+    if (bybitApiKey !== undefined && bybitApiKey !== '••••••••••••••••' && bybitApiKey !== '') {
+      updated.bybitApiKey = bybitApiKey;
+    } else {
+      updated.bybitApiKey = db.settings.bybitApiKey;
+    }
+
     if (bybitApiSecret !== undefined && bybitApiSecret !== '••••••••••••••••' && bybitApiSecret !== '') {
       updated.bybitApiSecret = bybitApiSecret;
+    } else {
+      updated.bybitApiSecret = db.settings.bybitApiSecret;
     }
+
+    if (webhookPassphrase !== undefined && webhookPassphrase !== '••••••••••••••••' && webhookPassphrase !== '') {
+      updated.webhookPassphrase = webhookPassphrase;
+    } else {
+      updated.webhookPassphrase = db.settings.webhookPassphrase;
+    }
+
     if (mt5Password !== undefined && mt5Password !== '••••••••••••••••' && mt5Password !== '') {
       updated.mt5Password = mt5Password;
+    } else {
+      updated.mt5Password = db.settings.mt5Password;
     }
-    if (mt5GatewayToken !== undefined && mt5GatewayToken !== '••••••••••••••••' && mt5GatewayToken !== '') {
-      updated.mt5GatewayToken = mt5GatewayToken;
+
+    if (gatewayToken !== undefined && gatewayToken !== '••••••••••••••••' && gatewayToken !== '') {
+      updated.mt5GatewayToken = gatewayToken;
+    } else if (req.body.mt5GatewayToken !== undefined && req.body.mt5GatewayToken !== '••••••••••••••••' && req.body.mt5GatewayToken !== '') {
+      updated.mt5GatewayToken = req.body.mt5GatewayToken;
+    } else {
+      updated.mt5GatewayToken = db.settings.mt5GatewayToken;
     }
 
     const newSettings = Database.updateSettings(updated);
@@ -137,7 +207,9 @@ app.post('/api/settings', (req, res) => {
       success: true,
       settings: {
         ...newSettings,
-        bybitApiSecret: newSettings.bybitApiSecret ? '••••••••••••••••' : '',
+        bybitApiKey: newSettings.bybitApiKey ? '••••••••••••••••' : '',
+        bybitApiSecret: newSettings.bybitApiKey ? '••••••••••••••••' : '',
+        webhookPassphrase: newSettings.webhookPassphrase ? '••••••••••••••••' : '',
         mt5Password: newSettings.mt5Password ? '••••••••••••••••' : '',
         mt5GatewayToken: newSettings.mt5GatewayToken ? '••••••••••••••••' : '',
       },
@@ -323,7 +395,7 @@ app.get('/api/positions', async (req, res) => {
         const client = new BybitClient({
           apiKey: db.settings.bybitApiKey,
           apiSecret: db.settings.bybitApiSecret,
-          isTestnet: db.settings.isTestnet,
+          environment: db.settings.bybitEnvironment,
         });
         const tick = await client.getTicker(db.settings.defaultSymbol || 'XAUUSDT');
         if (tick.lastPrice > 0) {
@@ -334,26 +406,39 @@ app.get('/api/positions', async (req, res) => {
       }
     }
     
-    if (db.settings.activeBroker === 'bybit' && (!db.settings.bybitApiKey || !db.settings.bybitApiSecret)) {
-      if (!(global as any).simulatedGoldPrice) {
-        (global as any).simulatedGoldPrice = 2375.50;
+    if ((db.settings.activeBroker === 'bybit' && (!db.settings.bybitApiKey || !db.settings.bybitApiSecret)) ||
+        (db.settings.activeBroker === 'mt5' && (!db.settings.mt5Login || !db.settings.mt5Password))) {
+      try {
+        const publicBybit = new BybitClient({
+          apiKey: '',
+          apiSecret: '',
+          environment: 'live',
+        });
+        const tick = await publicBybit.getTicker('XAUUSDT');
+        if (tick.lastPrice > 0) {
+          currentGoldPrice = tick.lastPrice;
+          (global as any).lastFetchedGoldPrice = currentGoldPrice;
+        }
+      } catch (e) {
+        if ((global as any).lastFetchedGoldPrice) {
+          currentGoldPrice = (global as any).lastFetchedGoldPrice;
+        } else {
+          if (!(global as any).simulatedGoldPrice) {
+            (global as any).simulatedGoldPrice = 2375.50;
+          }
+          (global as any).simulatedGoldPrice += (Math.random() - 0.5) * 1.8;
+          currentGoldPrice = (global as any).simulatedGoldPrice;
+        }
       }
-      (global as any).simulatedGoldPrice += (Math.random() - 0.5) * 1.8;
-      if ((global as any).simulatedGoldPrice < 2100) (global as any).simulatedGoldPrice = 2300;
-      if ((global as any).simulatedGoldPrice > 2600) (global as any).simulatedGoldPrice = 2450;
-      currentGoldPrice = (global as any).simulatedGoldPrice;
-    } else if (db.settings.activeBroker === 'mt5' && (!db.settings.mt5Login || !db.settings.mt5Password)) {
-      if (!(global as any).simulatedGoldPrice) {
-        (global as any).simulatedGoldPrice = 2375.50;
-      }
-      (global as any).simulatedGoldPrice += (Math.random() - 0.5) * 1.8;
-      if ((global as any).simulatedGoldPrice < 2100) (global as any).simulatedGoldPrice = 2300;
-      if ((global as any).simulatedGoldPrice > 2600) (global as any).simulatedGoldPrice = 2450;
-      currentGoldPrice = (global as any).simulatedGoldPrice;
     }
 
     // Update paper positions dynamically for Trailing Stop, SL and TP
     CentralRiskManager.updatePaperPositions(db, currentGoldPrice);
+
+    // Update live positions trailing and breakeven stops
+    if (!db.settings.isPaperTrading) {
+      await CentralRiskManager.updateLivePositions(db, currentGoldPrice);
+    }
 
     const result: any = {
       paperAccount: db.paperAccount,
@@ -364,56 +449,38 @@ app.get('/api/positions', async (req, res) => {
     };
 
     // Fetch actual broker account details based on selection
-    if (!db.settings.isPaperTrading && db.settings.activeBroker === 'mt5' && db.settings.mt5Login && db.settings.mt5Password) {
-      try {
-        const client = new MT5Client({
-          host: db.settings.mt5Host,
-          login: db.settings.mt5Login,
-          password: db.settings.mt5Password,
-          server: db.settings.mt5Server,
-          gatewayType: db.settings.mt5GatewayType,
-          gatewayUrl: db.settings.mt5GatewayUrl,
-          gatewayToken: db.settings.mt5GatewayToken,
-        });
-
-        const wallet = await client.getWalletBalance();
-        const positionsRaw = await client.getPositions();
-        
-        // Format MT5 positions
-        const positions = positionsRaw.map((p: any, idx: number) => {
-          const size = parseFloat(p.volume || p.qty || p.size || '0.1');
-          const side = (p.type || p.side || 'buy').toLowerCase().includes('sell') ? 'sell' : 'buy';
-          const entryPrice = parseFloat(p.openPrice || p.price || p.entryPrice || currentGoldPrice);
-          const currentPrice = parseFloat(p.currentPrice || p.price || currentGoldPrice);
-          const unrealizedPnl = parseFloat(p.profit || p.pnl || '0');
-
-          return {
-            id: p.ticket || p.positionId || `mt5-pos-${idx}`,
-            symbol: p.symbol || 'XAUUSD',
-            side,
-            entryPrice,
-            quantity: size,
-            leverage: parseFloat(p.leverage || '100'),
-            unrealizedPnl,
-            timestamp: p.time || new Date().toISOString(),
-            raw: p,
-          };
-        });
+    if (!db.settings.isPaperTrading && db.settings.activeBroker === 'mt5') {
+      const bridge = getBridgeStatus();
+      if (bridge.connected) {
+        const positions = bridge.positions.map((p: any) => ({
+          id: p.ticket,
+          symbol: p.symbol,
+          side: p.side,
+          entryPrice: p.entry,
+          quantity: p.volume,
+          leverage: 100,
+          unrealizedPnl: p.pnl,
+          timestamp: new Date().toISOString(),
+          raw: p,
+        }));
 
         result.liveAccount = {
-          balance: wallet.balance,
-          currency: wallet.currency,
+          balance: bridge.balance,
+          currency: 'USD',
           positions,
+          equity: bridge.equity,
+          freeMargin: bridge.freeMargin,
+          lastUpdated: bridge.lastHeartbeat ? new Date(bridge.lastHeartbeat).toISOString() : null,
         };
-      } catch (e: any) {
-        result.liveAccountError = e.message || 'Failed to fetch real MT5 account details.';
+      } else {
+        result.liveAccountError = 'MT5 terminal bridge is disconnected (no heartbeat received in last 90s).';
       }
     } else if (!db.settings.isPaperTrading && db.settings.bybitApiKey && db.settings.bybitApiSecret) {
       try {
         const client = new BybitClient({
           apiKey: db.settings.bybitApiKey,
           apiSecret: db.settings.bybitApiSecret,
-          isTestnet: db.settings.isTestnet,
+          environment: db.settings.bybitEnvironment,
         });
 
         const wallet = await client.getWalletBalance();
@@ -461,8 +528,80 @@ app.get('/api/positions', async (req, res) => {
   }
 });
 
+// 6a. Inverted MT5 Bridge: Command Polling Endpoints for MQL5 EA
+app.get('/api/mt5/commands', (req, res) => {
+  try {
+    const { login } = req.query;
+    if (!login) {
+      return res.status(400).json({ error: 'Missing account login parameter' });
+    }
+    const loginStr = String(login);
+    const cmds = mt5Queue.getPendingCommands(loginStr);
+    
+    // Once fetched, clear the commands from the queue to prevent double-processing
+    if (cmds.length > 0) {
+      mt5Queue.clearCommands(loginStr, cmds.map(c => c.id));
+    }
+    
+    res.json(cmds);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/mt5/results', (req, res) => {
+  try {
+    const { commandId, status, ticket, error } = req.body;
+    if (!commandId || !status) {
+      return res.status(400).json({ error: 'Missing commandId or status in body' });
+    }
+    mt5Queue.saveResult({
+      commandId,
+      status: status === 'success' ? 'success' : 'failed',
+      ticket: ticket ? String(ticket) : undefined,
+      error: error || undefined,
+    });
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/mt5/state', (req, res) => {
+  try {
+    const { login, balance, equity, currency, positions } = req.body;
+    if (!login) {
+      return res.status(400).json({ error: 'Missing account login in body' });
+    }
+    
+    const formattedPositions = (positions || []).map((p: any) => ({
+      ticket: String(p.ticket),
+      symbol: p.symbol || 'XAUUSD',
+      side: (p.side || 'buy').toLowerCase() === 'sell' ? 'sell' as const : 'buy' as const,
+      volume: parseFloat(p.volume || p.qty || '0.1'),
+      openPrice: parseFloat(p.openPrice || '0'),
+      sl: p.sl ? parseFloat(p.sl) : undefined,
+      tp: p.tp ? parseFloat(p.tp) : undefined,
+      pnl: parseFloat(p.pnl || p.profit || '0'),
+    }));
+
+    mt5Queue.updateState({
+      login: String(login),
+      balance: parseFloat(balance || '100000'),
+      equity: parseFloat(equity || balance || '100000'),
+      currency: currency || 'USD',
+      positions: formattedPositions,
+      lastUpdated: new Date().toISOString(),
+    });
+
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 6b. Run Strategy Backtester
-app.post('/api/backtest', (req, res) => {
+app.post('/api/backtest', async (req, res) => {
   try {
     const {
       fastEma,
@@ -488,7 +627,7 @@ app.post('/api/backtest', (req, res) => {
       timeStopBars,
     } = req.body;
 
-    const result = Backtester.run({
+    const result = await Backtester.run({
       fastEma: Number(fastEma || 12),
       slowEma: Number(slowEma || 26),
       rsiPeriod: Number(rsiPeriod || 14),
@@ -510,6 +649,7 @@ app.post('/api/backtest', (req, res) => {
       isPartialTPActive: Boolean(isPartialTPActive),
       isTimeStopActive: Boolean(isTimeStopActive),
       timeStopBars: timeStopBars !== undefined ? Number(timeStopBars) : 20,
+      symbol: 'XAUUSDT',
     });
 
     res.json(result);
@@ -585,11 +725,82 @@ app.post('/api/tradingview-webhook', async (req, res) => {
     // Resolve execute price (use payload price or fetch market ticker)
     let price = Number(payload.price || 0);
     if (!price) {
-      price = 2375.50 + (Math.random() - 0.5) * 10; // realistic gold default price if ticker fetch is not live
+      console.log(`[Webhook] Price missing in webhook payload. Fetching real ticker price for ${symbol}...`);
+      try {
+        if (settings.activeBroker === 'mt5') {
+          const client = new MT5Client({
+            host: settings.mt5Host,
+            login: settings.mt5Login,
+            password: settings.mt5Password,
+            server: settings.mt5Server,
+            gatewayType: settings.mt5GatewayType,
+            gatewayUrl: settings.mt5GatewayUrl,
+            gatewayToken: settings.mt5GatewayToken,
+          });
+          let mt5Symbol = symbol;
+          if (symbol === 'XAUUSDT') mt5Symbol = 'XAUUSD';
+          const tick = await client.getTicker(mt5Symbol);
+          if (tick && tick.lastPrice > 0) {
+            price = tick.lastPrice;
+          } else {
+            throw new Error(`Invalid lastPrice returned: ${JSON.stringify(tick)}`);
+          }
+        } else {
+          const client = new BybitClient({
+            apiKey: settings.bybitApiKey,
+            apiSecret: settings.bybitApiSecret,
+            environment: settings.bybitEnvironment,
+          });
+          const tick = await client.getTicker(symbol);
+          if (tick && tick.lastPrice > 0) {
+            price = tick.lastPrice;
+          } else {
+            throw new Error(`Invalid lastPrice returned: ${JSON.stringify(tick)}`);
+          }
+        }
+      } catch (e: any) {
+        const errMsg = `REJECTED (Price Fetch Failed): Webhook payload price was missing, and live market price fetch failed: ${e.message || e}`;
+        const log = Database.addLog({
+          rawBody: payload,
+          status: 'execution_failed',
+          action,
+          symbol,
+          price: 0,
+          quantity,
+          message: errMsg,
+          mode: settings.isPaperTrading ? 'paper' : 'live',
+        });
+        return res.status(400).json({ error: errMsg, logId: log.id });
+      }
     }
 
     // --- REGIME SWITCHING ROUTER ---
-    const adxValue = payload.adx !== undefined ? Number(payload.adx) : (21.5 + Math.random() * 5);
+    let adxValue = payload.adx !== undefined ? Number(payload.adx) : undefined;
+    if (adxValue === undefined) {
+      try {
+        const client = new BybitClient({
+          apiKey: settings.bybitApiKey,
+          apiSecret: settings.bybitApiSecret,
+          environment: settings.bybitEnvironment,
+        });
+        const mappedSymbol = symbol === 'XAUUSD' ? 'XAUUSDT' : symbol;
+        const klines = await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 });
+        if (klines && klines.length >= 30) {
+          const highs = klines.map((k: any) => k.high);
+          const lows = klines.map((k: any) => k.low);
+          const closes = klines.map((k: any) => k.close);
+          adxValue = Backtester.calculateADX(highs, lows, closes, 14);
+          console.log(`[RegimeRouter] Calculated real-time ADX(14) for ${symbol} from 15m klines: ${adxValue.toFixed(2)}`);
+        }
+      } catch (e: any) {
+        console.warn(`[RegimeRouter] Failed to fetch klines for real-time ADX calculation: ${e.message || e}`);
+      }
+    }
+
+    if (adxValue === undefined || isNaN(adxValue)) {
+      adxValue = 21.5 + Math.random() * 5;
+    }
+
     const regimeResult = RegimeRouter.getActiveRegime({
       adxValue,
       forceRegime: settings.activeRegimeModule,
@@ -728,8 +939,9 @@ app.post('/api/tradingview-webhook', async (req, res) => {
     } else {
       // REAL LIVE API EXECUTION MODE
       if (settings.activeBroker === 'mt5') {
-        if (!settings.mt5Login || !settings.mt5Password) {
-          const errMsg = 'MT5 Account Login credentials are missing. Please configure them in Settings or enable Paper Trading.';
+        const bridge = getBridgeStatus();
+        if (!bridge.connected) {
+          const errMsg = '[Bridge] MT5 terminal is not connected (no heartbeat in 90s). Order NOT queued.';
           const log = Database.addLog({
             rawBody: payload,
             status: 'execution_failed',
@@ -740,108 +952,46 @@ app.post('/api/tradingview-webhook', async (req, res) => {
             message: errMsg,
             mode,
           });
-          return res.status(400).json({ error: errMsg, logId: log.id });
+          return res.status(503).json({ error: errMsg, logId: log.id });
         }
 
-        try {
-          const client = new MT5Client({
-            host: settings.mt5Host,
-            login: settings.mt5Login,
-            password: settings.mt5Password,
-            server: settings.mt5Server,
-            gatewayType: settings.mt5GatewayType,
-            gatewayUrl: settings.mt5GatewayUrl,
-            gatewayToken: settings.mt5GatewayToken,
-          });
+        let mt5Symbol = symbol === 'XAUUSDT' ? 'XAUUSD' : symbol;
 
-          let orderResult;
-          let execMessage = '';
-
-          // Calculate stops for exchange placement
-          let slString: string | undefined = undefined;
-          let tpString: string | undefined = undefined;
-
-          // Standardize MT5 symbol format (usually XAUUSD for gold on prop firms)
-          let mt5Symbol = symbol;
-          if (symbol === 'XAUUSDT') {
-            mt5Symbol = 'XAUUSD';
-          }
-
-          if (action === 'buy') {
-            if (settings.isHybridStopsActive) {
-              slString = (price * (1 - settings.stopLossPercent / 100)).toFixed(2);
-              tpString = (price * (1 + settings.takeProfitPercent / 100)).toFixed(2);
-            }
-
-            orderResult = await client.placeOrder({
-              symbol: mt5Symbol,
-              side: 'Buy',
-              qty: String(finalQuantity),
-              orderType: 'Market',
-              stopLoss: slString,
-              takeProfit: tpString,
-            });
-            execMessage = `MT5 order created: Market BUY of ${finalQuantity} ${mt5Symbol}. Module: ${activeModule.toUpperCase()}. Stops: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}) ${riskReason}`;
-          } else if (action === 'sell') {
-            if (settings.isHybridStopsActive) {
-              slString = (price * (1 + settings.stopLossPercent / 100)).toFixed(2);
-              tpString = (price * (1 - settings.takeProfitPercent / 100)).toFixed(2);
-            }
-
-            orderResult = await client.placeOrder({
-              symbol: mt5Symbol,
-              side: 'Sell',
-              qty: String(finalQuantity),
-              orderType: 'Market',
-              stopLoss: slString,
-              takeProfit: tpString,
-            });
-            execMessage = `MT5 order created: Market SELL of ${finalQuantity} ${mt5Symbol}. Module: ${activeModule.toUpperCase()}. Stops: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}) ${riskReason}`;
-          } else if (action === 'close') {
-            const positions = await client.getPositions(mt5Symbol);
-            const activePos = positions.find((p: any) => parseFloat(p.volume || p.qty || p.size || '0') > 0);
-            
-            if (!activePos) {
-              execMessage = `MT5 exit aborted: No active position found on MT5 for ${mt5Symbol}.`;
-            } else {
-              const side = (activePos.type || activePos.side || 'Buy').toLowerCase().includes('sell') ? 'Buy' : 'Sell';
-              const qty = activePos.volume || activePos.qty || activePos.size;
-              orderResult = await client.placeOrder({
-                symbol: mt5Symbol,
-                side,
-                qty: String(qty),
-                orderType: 'Market',
-              });
-              execMessage = `MT5 exit order created: Closed position with Market ${side.toUpperCase()} of ${qty} ${mt5Symbol} (Order ID: ${orderResult.orderId})`;
-            }
-          }
-
-          const log = Database.addLog({
-            rawBody: payload,
-            status: orderResult ? 'success' : 'execution_failed',
-            action,
-            symbol: mt5Symbol,
+        let sl: number | undefined, tp: number | undefined;
+        if ((action === 'buy' || action === 'sell') && settings.isHybridStopsActive) {
+          const stops = CentralRiskManager.calculateDynamicStops({
             price,
-            quantity: finalQuantity,
-            message: execMessage,
-            mode,
+            side: action,
+            settings,
+            payloadAtr: payload.atr ? Number(payload.atr) : undefined,
+            activeModule,
           });
-
-          return res.json({ success: true, mode, logId: log.id, message: execMessage, orderResult });
-        } catch (err: any) {
-          const errMsg = `MT5 Execution failed: ${err.message || err}`;
-          const log = Database.addLog({
-            rawBody: payload,
-            status: 'execution_failed',
-            action,
-            symbol,
-            price,
-            quantity: finalQuantity,
-            message: errMsg,
-            mode,
-          });
-          return res.status(500).json({ error: errMsg, logId: log.id });
+          sl = stops.stopLossPrice;
+          tp = stops.takeProfitPrice;
         }
+
+        const cmd = enqueueMt5Command({
+          action: action === 'buy' ? 'BUY' : action === 'sell' ? 'SELL' : action === 'close' ? 'CLOSE' : 'CLOSE',
+          symbol: mt5Symbol,
+          volume: finalQuantity,
+          sl,
+          tp,
+          price,
+          comment: `moeby ${activeModule}`,
+          idempotencyKey: payload.alert_id || payload.id,
+        });
+
+        const log = Database.addLog({
+          rawBody: payload,
+          status: 'success',
+          action,
+          symbol: mt5Symbol,
+          price,
+          quantity: finalQuantity,
+          message: `[Bridge] ${cmd.action} ${finalQuantity} ${mt5Symbol} queued (id ${cmd.id.slice(0, 8)}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${riskReason}`,
+          mode,
+        });
+        return res.json({ success: true, mode, queued: true, commandId: cmd.id, logId: log.id });
       } else {
         // REAL BYBIT API EXECUTION MODE
         if (!settings.bybitApiKey || !settings.bybitApiSecret) {
@@ -863,7 +1013,7 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           const client = new BybitClient({
             apiKey: settings.bybitApiKey,
             apiSecret: settings.bybitApiSecret,
-            isTestnet: settings.isTestnet,
+            environment: settings.bybitEnvironment,
           });
 
           let orderResult;
@@ -872,6 +1022,11 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           // Calculate stops for exchange placement
           let slString: string | undefined = undefined;
           let tpString: string | undefined = undefined;
+
+          // Compute idempotent client order ID using prefix and hash
+          const prefix = settings.clientOrderIdPrefix || 'TF-';
+          const idToHash = String(payload.id ?? payload.timestamp ?? Date.now());
+          const orderLinkId = prefix + crypto.createHash('md5').update(idToHash).digest('hex').substring(0, 16);
 
           if (action === 'buy') {
             if (settings.isHybridStopsActive) {
@@ -886,8 +1041,9 @@ app.post('/api/tradingview-webhook', async (req, res) => {
               orderType: 'Market',
               stopLoss: slString,
               takeProfit: tpString,
+              orderLinkId,
             });
-            execMessage = `Bybit order created: Market BUY of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}) ${riskReason}`;
+            execMessage = `Bybit order created: Market BUY of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}, ClientID: ${orderLinkId}) ${riskReason}`;
           } else if (action === 'sell') {
             if (settings.isHybridStopsActive) {
               slString = (price * (1 + settings.stopLossPercent / 100)).toFixed(2);
@@ -901,8 +1057,9 @@ app.post('/api/tradingview-webhook', async (req, res) => {
               orderType: 'Market',
               stopLoss: slString,
               takeProfit: tpString,
+              orderLinkId,
             });
-            execMessage = `Bybit order created: Market SELL of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}) ${riskReason}`;
+            execMessage = `Bybit order created: Market SELL of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}, ClientID: ${orderLinkId}) ${riskReason}`;
           } else if (action === 'close') {
             // Close: get active position and reverse it
             const positions = await client.getPositions(symbol);
@@ -918,6 +1075,7 @@ app.post('/api/tradingview-webhook', async (req, res) => {
                 side,
                 qty,
                 orderType: 'Market',
+                reduceOnly: true,
               });
               execMessage = `Bybit exit order created: Closed position with Market ${side.toUpperCase()} of ${qty} ${symbol} (Order ID: ${orderResult.orderId})`;
             }

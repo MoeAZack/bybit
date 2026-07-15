@@ -1121,7 +1121,7 @@ export default function App() {
                           <span>LIVE SYNCHRONIZATION OFFLINE</span>
                         </div>
                         <span className="text-neutral-300 leading-normal">
-                          Unable to stream live account balance. Ensure your MT5 REST Bridge is running at <code className="text-amber-400">{settings.mt5Host}</code>.
+                          Unable to stream live account balance. Ensure your <strong>MoebyBridge EA</strong> is loaded on your MT5 terminal, configured with your correct server URL and bridge token, and actively heartbeating.
                         </span>
                         <span className="text-neutral-400 text-[9px] font-sans">Showing simulated paper fallback in the meantime.</span>
                         <button

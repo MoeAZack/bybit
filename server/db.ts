@@ -32,6 +32,7 @@ export interface TradingSettings {
   bybitApiKey: string;
   bybitApiSecret: string;
   isTestnet: boolean;
+  bybitEnvironment: 'demo' | 'testnet' | 'live';
   isPaperTrading: boolean;
   webhookPassphrase: string;
   defaultSymbol: string;
@@ -117,11 +118,21 @@ export interface DbSchema {
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
 
+export function getContractMultiplier(symbol: string): number {
+  if (!symbol) return 1;
+  const s = symbol.toUpperCase().trim();
+  if (s === 'XAUUSDT' || s === 'XAUUSD' || s === 'GOLD') {
+    return 1; // Bybit linear gold: 1 contract = 1 oz
+  }
+  return 1; // default multiplier
+}
+
 const defaultDb: DbSchema = {
   settings: {
     bybitApiKey: '',
     bybitApiSecret: '',
     isTestnet: true,
+    bybitEnvironment: 'demo',
     isPaperTrading: true,
     webhookPassphrase: 'GOLD_ALGO_88',
     defaultSymbol: 'XAUUSDT',
@@ -395,9 +406,11 @@ export class Database {
     if (acc.password) {
       db.settings.mt5Password = acc.password;
     }
-    db.settings.mt5Host = acc.gatewayType === 'local' ? db.settings.mt5Host : acc.gatewayUrl;
     db.settings.mt5GatewayType = acc.gatewayType;
     db.settings.mt5GatewayUrl = acc.gatewayUrl;
+    if (acc.gatewayType === 'local') {
+      db.settings.mt5Host = acc.gatewayUrl;
+    }
     if (acc.gatewayToken) {
       db.settings.mt5GatewayToken = acc.gatewayToken;
     }
@@ -423,9 +436,11 @@ export class Database {
       if (acc.password) {
         db.settings.mt5Password = acc.password;
       }
-      db.settings.mt5Host = acc.gatewayType === 'local' ? db.settings.mt5Host : acc.gatewayUrl;
       db.settings.mt5GatewayType = acc.gatewayType;
       db.settings.mt5GatewayUrl = acc.gatewayUrl;
+      if (acc.gatewayType === 'local') {
+        db.settings.mt5Host = acc.gatewayUrl;
+      }
       if (acc.gatewayToken) {
         db.settings.mt5GatewayToken = acc.gatewayToken;
       }
@@ -507,9 +522,9 @@ export class Database {
     const pos = db.paperAccount.positions[posIndex];
     // Calculate PnL: Long: (current - entry) * qty * leverage, Short: (entry - current) * qty * leverage
     // Let's calculate standard contract perpetual PnL:
-    // PnL = SideFactor * (CurrentPrice - EntryPrice) * Quantity
+    // PnL = SideFactor * (CurrentPrice - EntryPrice) * Quantity * ContractMultiplier
     const sideFactor = pos.side === 'buy' ? 1 : -1;
-    const pnl = sideFactor * (currentPrice - pos.entryPrice) * pos.quantity * 10; // scaled matching our Bybit multipliers
+    const pnl = sideFactor * (currentPrice - pos.entryPrice) * pos.quantity * getContractMultiplier(pos.symbol);
 
     // Remove position
     db.paperAccount.positions.splice(posIndex, 1);
