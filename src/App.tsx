@@ -136,6 +136,26 @@ interface SettingsState {
   consecutiveLossDownscale: number;
   isRolloverFilterActive: boolean;
   maxSpreadUsd: number;
+  reversion: {
+    enabled: boolean;
+    symbol: string;
+    timeframe: string;
+    adxPeriod: number;
+    adxRangeThreshold: number;
+    rsiPeriod: number;
+    rsiLongBelow: number;
+    rsiShortAbove: number;
+    bbPeriod: number;
+    bbStdDev: number;
+    vwapStretchAtr: number;
+    maxRungs: number;
+    rungSpacingAtr: number;
+    basketRiskUsd: number;
+    stopBeyondLastRungAtr: number;
+    tpTarget: 'vwap' | 'bbMid';
+    timeStopBars: number;
+    maxSpreadUsd: number;
+  };
   // MT5 Prop-Firm settings
   activeBroker: 'bybit' | 'mt5';
   mt5Host: string;
@@ -198,6 +218,26 @@ export default function App() {
     consecutiveLossDownscale: 0.85,
     isRolloverFilterActive: true,
     maxSpreadUsd: 0.75,
+    reversion: {
+      enabled: false,
+      symbol: 'XAUUSDT',
+      timeframe: '15',
+      adxPeriod: 14,
+      adxRangeThreshold: 20,
+      rsiPeriod: 14,
+      rsiLongBelow: 25,
+      rsiShortAbove: 75,
+      bbPeriod: 20,
+      bbStdDev: 2,
+      vwapStretchAtr: 1.5,
+      maxRungs: 3,
+      rungSpacingAtr: 0.75,
+      basketRiskUsd: 75,
+      stopBeyondLastRungAtr: 1.0,
+      tpTarget: 'bbMid',
+      timeStopBars: 16,
+      maxSpreadUsd: 0.60,
+    },
     // MT5 Prop-Firm defaults
     activeBroker: 'bybit',
     mt5Host: 'http://localhost:5000',

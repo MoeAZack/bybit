@@ -231,6 +231,9 @@ export class BybitClient {
     takeProfit?: string;
     orderLinkId?: string;
     reduceOnly?: boolean;
+    triggerPrice?: string;
+    triggerDirection?: number;
+    triggerBy?: string;
   }): Promise<any> {
     const orderParams: Record<string, any> = {
       category: 'linear',
@@ -264,10 +267,67 @@ export class BybitClient {
       orderParams.reduceOnly = true;
     }
 
+    if (params.triggerPrice) {
+      orderParams.triggerPrice = params.triggerPrice;
+    }
+
+    if (params.triggerDirection) {
+      orderParams.triggerDirection = params.triggerDirection;
+    }
+
+    if (params.triggerBy) {
+      orderParams.triggerBy = params.triggerBy;
+    }
+
     try {
       return await this.request('POST', '/v5/order/create', orderParams);
     } catch (e: any) {
       console.warn(`Failed to place Bybit order: ${e.message || String(e)}`);
+      throw e;
+    }
+  }
+
+  /**
+   * Cancel an open order
+   */
+  public async cancelOrder(params: {
+    symbol: string;
+    orderId?: string;
+    orderLinkId?: string;
+  }): Promise<any> {
+    const cancelParams: Record<string, any> = {
+      category: 'linear',
+      symbol: params.symbol,
+    };
+    if (params.orderId) cancelParams.orderId = params.orderId;
+    if (params.orderLinkId) cancelParams.orderLinkId = params.orderLinkId;
+    try {
+      return await this.request('POST', '/v5/order/cancel', cancelParams);
+    } catch (e: any) {
+      console.warn(`Failed to cancel Bybit order: ${e.message || String(e)}`);
+      throw e;
+    }
+  }
+
+  /**
+   * Get list of open (active) orders
+   */
+  public async getOpenOrders(params: {
+    symbol: string;
+    orderId?: string;
+    orderLinkId?: string;
+  }): Promise<any[]> {
+    const getParams: Record<string, any> = {
+      category: 'linear',
+      symbol: params.symbol,
+    };
+    if (params.orderId) getParams.orderId = params.orderId;
+    if (params.orderLinkId) getParams.orderLinkId = params.orderLinkId;
+    try {
+      const result = await this.request('GET', '/v5/order/realtime', getParams);
+      return result?.list || [];
+    } catch (e: any) {
+      console.warn(`Failed to retrieve open Bybit orders: ${e.message || String(e)}`);
       throw e;
     }
   }

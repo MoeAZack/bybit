@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import { mt5Queue } from './mt5Queue.js';
 
 export interface MT5Config {
   host: string;       // REST API / WebAPI endpoint (e.g., http://your-mt5-bridge.com:5000)
@@ -208,30 +207,6 @@ export class MT5Client {
     stopLoss?: string;
     takeProfit?: string;
   }): Promise<any> {
-    const state = mt5Queue.getState(this.login);
-    const isEaActive = state && (Date.now() - new Date(state.lastUpdated).getTime() < 60000);
-
-    if (isEaActive) {
-      console.log(`[MT5Client] Directing order through Active Outbound Polling EA for login ${this.login}`);
-      const cmdId = mt5Queue.pushCommand(this.login, params.side.toUpperCase() as 'BUY' | 'SELL', params.symbol, {
-        volume: parseFloat(params.qty),
-        sl: params.stopLoss ? parseFloat(params.stopLoss) : undefined,
-        tp: params.takeProfit ? parseFloat(params.takeProfit) : undefined,
-        price: params.price ? parseFloat(params.price) : undefined,
-      });
-
-      const result = await mt5Queue.waitForResult(cmdId, 10000);
-      if (result.status === 'success') {
-        return {
-          orderId: result.ticket || 'mt5-' + Math.floor(Math.random() * 10000000),
-          status: 'success',
-          raw: result,
-        };
-      } else {
-        throw new Error(result.error || 'Outbound EA execution failed.');
-      }
-    }
-
     const orderParams: Record<string, any> = {
       symbol: params.symbol,
       action: params.side.toUpperCase(), // BUY or SELL
@@ -271,29 +246,6 @@ export class MT5Client {
     stopLoss?: string;
     takeProfit?: string;
   }): Promise<any> {
-    const state = mt5Queue.getState(this.login);
-    const isEaActive = state && (Date.now() - new Date(state.lastUpdated).getTime() < 60000);
-
-    if (isEaActive) {
-      console.log(`[MT5Client] Directing modify position through Active Outbound Polling EA for login ${this.login}`);
-      const cmdId = mt5Queue.pushCommand(this.login, 'MODIFY', params.symbol, {
-        ticket: params.ticket,
-        sl: params.stopLoss ? parseFloat(params.stopLoss) : undefined,
-        tp: params.takeProfit ? parseFloat(params.takeProfit) : undefined,
-      });
-
-      const result = await mt5Queue.waitForResult(cmdId, 10000);
-      if (result.status === 'success') {
-        return {
-          ticket: params.ticket,
-          status: 'success',
-          raw: result,
-        };
-      } else {
-        throw new Error(result.error || 'Outbound EA position modification failed.');
-      }
-    }
-
     const modifyParams: Record<string, any> = {
       symbol: params.symbol,
       ticket: Number(params.ticket),

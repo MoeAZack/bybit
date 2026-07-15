@@ -97,56 +97,56 @@ export class CentralRiskManager {
     const { symbol, settings } = params;
     const maxSpread = settings.maxSpreadUsd;
     
-    let spread = 0.35; // default realistic paper spread in USD for Gold
-    if (settings.isPaperTrading) {
-      // Simulate random spread spikes occasionally (e.g. 5% chance of spike up to 1.50)
-      if (Math.random() < 0.05) {
-        spread = 0.95 + Math.random() * 0.4;
+    let spread: number | null = null;
+    let fetched = false;
+
+    try {
+      // Map symbols to Bybit format (Bybit uses XAUUSDT, MT5 often uses XAUUSD)
+      let mappedSymbol = symbol;
+      if (symbol === 'XAUUSD') {
+        mappedSymbol = 'XAUUSDT';
+      }
+
+      if (settings.activeBroker === 'bybit' && settings.bybitApiKey && settings.bybitApiSecret) {
+        // Live Bybit with user credentials
+        const client = new BybitClient({
+          apiKey: settings.bybitApiKey,
+          apiSecret: settings.bybitApiSecret,
+          isTestnet: settings.isTestnet,
+        });
+        const ticker = await client.getTicker(mappedSymbol);
+        const rawTicker = (ticker as any).raw?.list?.[0];
+        const bid = Number(rawTicker?.bid1Price || rawTicker?.bidPrice || ticker.lastPrice);
+        const ask = Number(rawTicker?.ask1Price || rawTicker?.askPrice || ticker.lastPrice);
+        if (bid > 0 && ask > 0) {
+          spread = ask - bid;
+          fetched = true;
+        }
       } else {
-        spread = 0.20 + Math.random() * 0.25;
-      }
-    } else {
-      // Live Trading: Fetch actual ticker bid-ask from Bybit or MT5 depending on active broker
-      try {
-        let fetched = false;
-        if (settings.activeBroker === 'mt5') {
-          if (settings.mt5Login && settings.mt5Password) {
-            const client = new MT5Client({
-              host: settings.mt5Host,
-              login: settings.mt5Login,
-              password: settings.mt5Password,
-              server: settings.mt5Server,
-            });
-            const ticker = await client.getTicker(symbol);
-            // Simulating typical bid/ask from MT5 ticker response if available, or random spread
-            spread = 0.22 + Math.random() * 0.15;
-            fetched = true;
-          }
-        } else if (settings.bybitApiKey && settings.bybitApiSecret) {
-          const client = new BybitClient({
-            apiKey: settings.bybitApiKey,
-            apiSecret: settings.bybitApiSecret,
-            isTestnet: settings.isTestnet,
-          });
-          const ticker = await client.getTicker(symbol);
-          const rawTicker = (ticker as any).raw?.list?.[0];
-          const bid = Number(rawTicker?.bid1Price || rawTicker?.bidPrice || ticker.lastPrice);
-          const ask = Number(rawTicker?.ask1Price || rawTicker?.askPrice || ticker.lastPrice);
-          if (bid > 0 && ask > 0) {
-            spread = ask - bid;
-            fetched = true;
-          }
+        // Fetch via public Bybit Client (handles Paper trading and MT5 too!)
+        const publicBybit = new BybitClient({
+          apiKey: '',
+          apiSecret: '',
+          environment: 'live',
+        });
+        const ticker = await publicBybit.getTicker(mappedSymbol);
+        const rawTicker = (ticker as any).raw?.list?.[0];
+        const bid = Number(rawTicker?.bid1Price || rawTicker?.bidPrice || ticker.lastPrice);
+        const ask = Number(rawTicker?.ask1Price || rawTicker?.askPrice || ticker.lastPrice);
+        if (bid > 0 && ask > 0) {
+          spread = ask - bid;
+          fetched = true;
         }
-        if (!fetched) {
-          throw new Error('Broker API key or MT5 credentials are not configured.');
-        }
-      } catch (e: any) {
-        console.error('Failed to fetch real orderbook spread, vetoing execution:', e);
-        return {
-          allowed: false,
-          reason: `VETO (Slippage Gate): Failed to fetch real-time bid-ask spread from broker (${e.message || e}). Entry blocked for safety.`,
-        };
       }
+    } catch (e: any) {
+      console.error('[checkSpreadLimit] Failed to fetch real-time spread:', e.message || e);
+    }
+
+    if (!fetched || spread === null || isNaN(spread)) {
+      return {
+        allowed: false,
+        reason: `VETO (Slippage Gate): Failed to fetch real-time bid-ask spread. Entry blocked for safety (fail-closed).`,
+      };
     }
 
     if (spread > maxSpread) {

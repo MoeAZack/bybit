@@ -8,8 +8,8 @@ import { MT5Client } from './server/mt5.js';
 import { Backtester } from './server/backtester.js';
 import { CentralRiskManager } from './server/risk.js';
 import { RegimeRouter } from './server/router.js';
+import { BasketManager } from './server/basketManager.js';
 import { GoogleGenAI } from '@google/genai';
-import { mt5Queue } from './server/mt5Queue.js';
 import { registerMt5BridgeRoutes, enqueueMt5Command, getBridgeStatus } from './server/mt5bridge.js';
 
 const app = express();
@@ -423,11 +423,7 @@ app.get('/api/positions', async (req, res) => {
         if ((global as any).lastFetchedGoldPrice) {
           currentGoldPrice = (global as any).lastFetchedGoldPrice;
         } else {
-          if (!(global as any).simulatedGoldPrice) {
-            (global as any).simulatedGoldPrice = 2375.50;
-          }
-          (global as any).simulatedGoldPrice += (Math.random() - 0.5) * 1.8;
-          currentGoldPrice = (global as any).simulatedGoldPrice;
+          currentGoldPrice = 2375.50; // Dynamic random walk disabled for measurement honesty
         }
       }
     }
@@ -528,78 +524,6 @@ app.get('/api/positions', async (req, res) => {
   }
 });
 
-// 6a. Inverted MT5 Bridge: Command Polling Endpoints for MQL5 EA
-app.get('/api/mt5/commands', (req, res) => {
-  try {
-    const { login } = req.query;
-    if (!login) {
-      return res.status(400).json({ error: 'Missing account login parameter' });
-    }
-    const loginStr = String(login);
-    const cmds = mt5Queue.getPendingCommands(loginStr);
-    
-    // Once fetched, clear the commands from the queue to prevent double-processing
-    if (cmds.length > 0) {
-      mt5Queue.clearCommands(loginStr, cmds.map(c => c.id));
-    }
-    
-    res.json(cmds);
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/mt5/results', (req, res) => {
-  try {
-    const { commandId, status, ticket, error } = req.body;
-    if (!commandId || !status) {
-      return res.status(400).json({ error: 'Missing commandId or status in body' });
-    }
-    mt5Queue.saveResult({
-      commandId,
-      status: status === 'success' ? 'success' : 'failed',
-      ticket: ticket ? String(ticket) : undefined,
-      error: error || undefined,
-    });
-    res.json({ success: true });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/mt5/state', (req, res) => {
-  try {
-    const { login, balance, equity, currency, positions } = req.body;
-    if (!login) {
-      return res.status(400).json({ error: 'Missing account login in body' });
-    }
-    
-    const formattedPositions = (positions || []).map((p: any) => ({
-      ticket: String(p.ticket),
-      symbol: p.symbol || 'XAUUSD',
-      side: (p.side || 'buy').toLowerCase() === 'sell' ? 'sell' as const : 'buy' as const,
-      volume: parseFloat(p.volume || p.qty || '0.1'),
-      openPrice: parseFloat(p.openPrice || '0'),
-      sl: p.sl ? parseFloat(p.sl) : undefined,
-      tp: p.tp ? parseFloat(p.tp) : undefined,
-      pnl: parseFloat(p.pnl || p.profit || '0'),
-    }));
-
-    mt5Queue.updateState({
-      login: String(login),
-      balance: parseFloat(balance || '100000'),
-      equity: parseFloat(equity || balance || '100000'),
-      currency: currency || 'USD',
-      positions: formattedPositions,
-      lastUpdated: new Date().toISOString(),
-    });
-
-    res.json({ success: true });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // 6b. Run Strategy Backtester
 app.post('/api/backtest', async (req, res) => {
   try {
@@ -625,6 +549,11 @@ app.post('/api/backtest', async (req, res) => {
       isPartialTPActive,
       isTimeStopActive,
       timeStopBars,
+      backtestModule,
+      reversionRiskUsd,
+      reversionMaxRungs,
+      reversionRungSpacingAtr,
+      reversionStopBeyondLastRungAtr,
     } = req.body;
 
     const result = await Backtester.run({
@@ -650,6 +579,11 @@ app.post('/api/backtest', async (req, res) => {
       isTimeStopActive: Boolean(isTimeStopActive),
       timeStopBars: timeStopBars !== undefined ? Number(timeStopBars) : 20,
       symbol: 'XAUUSDT',
+      backtestModule: backtestModule || 'trend',
+      reversionRiskUsd: reversionRiskUsd !== undefined ? Number(reversionRiskUsd) : 100.0,
+      reversionMaxRungs: reversionMaxRungs !== undefined ? Number(reversionMaxRungs) : 3,
+      reversionRungSpacingAtr: reversionRungSpacingAtr !== undefined ? Number(reversionRungSpacingAtr) : 1.0,
+      reversionStopBeyondLastRungAtr: reversionStopBeyondLastRungAtr !== undefined ? Number(reversionStopBeyondLastRungAtr) : 1.5,
     });
 
     res.json(result);
@@ -808,6 +742,62 @@ app.post('/api/tradingview-webhook', async (req, res) => {
     });
     const activeModule = regimeResult.regime;
     const routerReason = regimeResult.reason;
+
+    // --- INTEGRATED MEAN-REVERSION REGIME ROUTING ---
+    if (activeModule === 'range') {
+      console.log(`[Webhook] Intercepted range/reversion regime. Routing to BasketManager.`);
+      try {
+        const client = new BybitClient({
+          apiKey: settings.bybitApiKey,
+          apiSecret: settings.bybitApiSecret,
+          environment: settings.bybitEnvironment,
+        });
+        const mappedSymbol = symbol === 'XAUUSD' ? 'XAUUSDT' : symbol;
+        const klines = await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 });
+
+        if (action === 'buy' || action === 'sell') {
+          const triggerResult = await BasketManager.checkGatesAndTrigger(klines, settings);
+          const logStatus = triggerResult.triggered ? 'success' : 'execution_failed';
+          const log = Database.addLog({
+            rawBody: payload,
+            status: logStatus,
+            action,
+            symbol,
+            price,
+            quantity,
+            message: triggerResult.reason,
+            mode: settings.isPaperTrading ? 'paper' : 'live',
+          });
+          return res.json({ success: triggerResult.triggered, mode: settings.isPaperTrading ? 'paper' : 'live', message: triggerResult.reason, logId: log.id });
+        } else if (action === 'close') {
+          await BasketManager.closeBasket('completed', price, settings);
+          const log = Database.addLog({
+            rawBody: payload,
+            status: 'success',
+            action,
+            symbol,
+            price,
+            quantity,
+            message: 'Consolidated Mean Reversion Basket Closed.',
+            mode: settings.isPaperTrading ? 'paper' : 'live',
+          });
+          return res.json({ success: true, mode: settings.isPaperTrading ? 'paper' : 'live', message: 'Consolidated Mean Reversion Basket Closed.', logId: log.id });
+        }
+      } catch (err: any) {
+        const errMsg = `Range Module Execution failed: ${err.message || err}`;
+        const log = Database.addLog({
+          rawBody: payload,
+          status: 'execution_failed',
+          action,
+          symbol,
+          price,
+          quantity,
+          message: errMsg,
+          mode: settings.isPaperTrading ? 'paper' : 'live',
+        });
+        return res.status(500).json({ error: errMsg, logId: log.id });
+      }
+    }
 
     // --- CENTRAL RISK LAYER (VETO POWER) ---
     let finalQuantity = quantity;
@@ -1209,6 +1199,73 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
+
+    // STARTUP RECONCILIATION & MONITORING TASK
+    const db = Database.get();
+    const settings = db.settings;
+
+    console.log('[BasketManager] Running startup reconciliation and initializing active polling loops...');
+    BasketManager.reconcileStartup(settings).catch(e => {
+      console.error('[BasketManager] Startup reconciliation failed:', e.message || e);
+    });
+
+    // Setup periodic polling loop every 10 seconds
+    let lastConfirmedCandleTime = 0;
+
+    setInterval(async () => {
+      try {
+        const activeBasket = BasketManager.getActiveBasket();
+        if (!activeBasket || activeBasket.status !== 'ACTIVE') return;
+
+        const currentDb = Database.get();
+        const currentSettings = currentDb.settings;
+
+        // Fetch the current price
+        let currentPrice = 0;
+        const mappedSymbol = activeBasket.symbol === 'XAUUSD' ? 'XAUUSDT' : activeBasket.symbol;
+
+        const publicBybit = new BybitClient({ apiKey: '', apiSecret: '', environment: 'live' });
+        const ticker = await publicBybit.getTicker(mappedSymbol);
+        if (ticker && ticker.lastPrice > 0) {
+          currentPrice = ticker.lastPrice;
+        }
+
+        if (currentPrice > 0) {
+          // Monitor for fills, stops, and blackout events
+          await BasketManager.monitorUpdate(currentPrice, currentSettings);
+        }
+
+        // Check if a new 15-minute candle has confirmed
+        const now = Date.now();
+        const currentCandlePeriodMs = 15 * 60 * 1000;
+        const currentCandleTime = Math.floor(now / currentCandlePeriodMs) * currentCandlePeriodMs;
+
+        if (lastConfirmedCandleTime === 0) {
+          lastConfirmedCandleTime = currentCandleTime;
+        } else if (currentCandleTime > lastConfirmedCandleTime) {
+          console.log(`[BasketManager] New 15m candle confirmed. Fetching historical candle series...`);
+          lastConfirmedCandleTime = currentCandleTime;
+
+          // Fetch recent klines to recompute dynamic TP target or check time stops
+          const client = new BybitClient({
+            apiKey: currentSettings.bybitApiKey,
+            apiSecret: currentSettings.bybitApiSecret,
+            environment: currentSettings.bybitEnvironment,
+          });
+
+          const klines = await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 });
+          if (klines && klines.length >= 30) {
+            const closes = klines.map((k: any) => k.close);
+            const highs = klines.map((k: any) => k.high);
+            const lows = klines.map((k: any) => k.low);
+            const volumes = klines.map((k: any) => k.volume || k.vol || 1);
+            await BasketManager.handleConfirmedCandle(closes, highs, lows, volumes, currentSettings);
+          }
+        }
+      } catch (e: any) {
+        console.error('[BasketManager Poll] Error in background monitor loop:', e.message || e);
+      }
+    }, 10000);
   });
 }
 

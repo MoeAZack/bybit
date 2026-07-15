@@ -1,0 +1,394 @@
+{
+  "settings": {
+    "bybitApiKey": "",
+    "bybitApiSecret": "",
+    "isTestnet": true,
+    "bybitEnvironment": "demo",
+    "isPaperTrading": true,
+    "webhookPassphrase": "GOLD_ALGO_88",
+    "defaultSymbol": "XAUUSDT",
+    "defaultLeverage": 10,
+    "defaultOrderSize": 0.1,
+    "stopLossPercent": 1.5,
+    "takeProfitPercent": 3,
+    "maxPositionSize": 1,
+    "maxDailyLoss": 500,
+    "maxConsecutiveLosses": 5,
+    "isKillSwitchActive": false,
+    "ipWhitelist": "0.0.0.0 (Allow All)",
+    "clientOrderIdPrefix": "TF_GOLD_",
+    "isHybridStopsActive": true,
+    "isSessionFilterActive": false,
+    "allowedSessions": [
+      "london",
+      "new_york"
+    ],
+    "isCentralRiskVetoActive": true,
+    "maxPortfolioRiskPercent": 3,
+    "activeRegimeModule": "auto",
+    "isDynamicSlActive": true,
+    "atrMultiplier": 1.5,
+    "isTrailingStopActive": true,
+    "breakevenMultiplier": 1,
+    "isCompoundingActive": true,
+    "consecutiveWinMultiplier": 1.15,
+    "consecutiveLossDownscale": 0.5,
+    "maxSpreadUsd": 0.8,
+    "isRolloverFilterActive": true,
+    "reversion": {
+      "enabled": false,
+      "symbol": "XAUUSDT",
+      "timeframe": "15",
+      "adxPeriod": 14,
+      "adxRangeThreshold": 20,
+      "rsiPeriod": 14,
+      "rsiLongBelow": 25,
+      "rsiShortAbove": 75,
+      "bbPeriod": 20,
+      "bbStdDev": 2,
+      "vwapStretchAtr": 1.5,
+      "maxRungs": 3,
+      "rungSpacingAtr": 0.75,
+      "basketRiskUsd": 75,
+      "stopBeyondLastRungAtr": 1,
+      "tpTarget": "bbMid",
+      "timeStopBars": 16,
+      "maxSpreadUsd": 0.6
+    },
+    "activeBroker": "bybit",
+    "mt5Host": "http://localhost:5000",
+    "mt5Login": "",
+    "mt5Password": "",
+    "mt5Server": "FTMO-Demo",
+    "mt5GatewayType": "local",
+    "mt5GatewayUrl": "https://api.mtapi.be",
+    "mt5GatewayToken": ""
+  },
+  "logs": [
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "reason": "basket_stop",
+        "pnl": -59.94,
+        "R": -0.5993999999999999
+      },
+      "status": "success",
+      "action": "close",
+      "symbol": "XAUUSDT",
+      "price": 1990,
+      "quantity": 9.99,
+      "message": "[BasketManager] Consolidated Reversion Trade Closed: BASKET_STOP. Avg Entry: 1996.00, Exit: 1990.00, Rungs filled: 3. PnL: $-59.94 (-0.60 R)",
+      "mode": "paper",
+      "id": "log-yvfp6bzsd",
+      "timestamp": "2026-07-15T15:48:48.170Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "rung": 3
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 1992,
+      "quantity": 3.33,
+      "message": "[BasketManager] Paper Rung 3 filled at 1992 (Size: 3.33 XAUUSDT). Total filled size: 9.99.",
+      "mode": "paper",
+      "id": "log-tvawh8agv",
+      "timestamp": "2026-07-15T15:48:48.169Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "rung": 2
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 1996,
+      "quantity": 3.33,
+      "message": "[BasketManager] Paper Rung 2 filled at 1996 (Size: 3.33 XAUUSDT). Total filled size: 6.66.",
+      "mode": "paper",
+      "id": "log-vcnt4n5nw",
+      "timestamp": "2026-07-15T15:48:48.168Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "reason": "basket_stop",
+        "pnl": -59.94,
+        "R": -0.5993999999999999
+      },
+      "status": "success",
+      "action": "close",
+      "symbol": "XAUUSDT",
+      "price": 1990,
+      "quantity": 9.99,
+      "message": "[BasketManager] Consolidated Reversion Trade Closed: BASKET_STOP. Avg Entry: 1996.00, Exit: 1990.00, Rungs filled: 3. PnL: $-59.94 (-0.60 R)",
+      "mode": "paper",
+      "id": "log-aqmffvrii",
+      "timestamp": "2026-07-15T15:47:56.904Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "rung": 3
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 1992,
+      "quantity": 3.33,
+      "message": "[BasketManager] Paper Rung 3 filled at 1992 (Size: 3.33 XAUUSDT). Total filled size: 9.99.",
+      "mode": "paper",
+      "id": "log-xf6e033i2",
+      "timestamp": "2026-07-15T15:47:56.902Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "rung": 2
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 1996,
+      "quantity": 3.33,
+      "message": "[BasketManager] Paper Rung 2 filled at 1996 (Size: 3.33 XAUUSDT). Total filled size: 6.66.",
+      "mode": "paper",
+      "id": "log-16488ymb3",
+      "timestamp": "2026-07-15T15:47:56.901Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "reason": "basket_stop",
+        "pnl": -59.94,
+        "R": -0.5993999999999999
+      },
+      "status": "success",
+      "action": "close",
+      "symbol": "XAUUSDT",
+      "price": 1990,
+      "quantity": 9.99,
+      "message": "[BasketManager] Consolidated Reversion Trade Closed: BASKET_STOP. Avg Entry: 1996.00, Exit: 1990.00, Rungs filled: 3. PnL: $-59.94 (-0.60 R)",
+      "mode": "paper",
+      "id": "log-37q5ejhcw",
+      "timestamp": "2026-07-15T15:47:42.315Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "rung": 3
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 1992,
+      "quantity": 3.33,
+      "message": "[BasketManager] Paper Rung 3 filled at 1992 (Size: 3.33 XAUUSDT). Total filled size: 9.99.",
+      "mode": "paper",
+      "id": "log-xyxc9z0cy",
+      "timestamp": "2026-07-15T15:47:42.313Z"
+    },
+    {
+      "rawBody": {
+        "basketId": "test-basket-999",
+        "rung": 2
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 1996,
+      "quantity": 3.33,
+      "message": "[BasketManager] Paper Rung 2 filled at 1996 (Size: 3.33 XAUUSDT). Total filled size: 6.66.",
+      "mode": "paper",
+      "id": "log-ehjy3qydi",
+      "timestamp": "2026-07-15T15:47:42.313Z"
+    },
+    {
+      "id": "log-1",
+      "timestamp": "2026-07-15T10:22:44.100Z",
+      "rawBody": {
+        "passphrase": "GOLD_ALGO_88",
+        "action": "buy",
+        "symbol": "XAUUSDT",
+        "price": 2362.45,
+        "volume": 0.1,
+        "comment": "TradingView Golden Cross alert on 15m timeframe"
+      },
+      "status": "success",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 2362.45,
+      "quantity": 0.1,
+      "message": "Paper Trade executed successfully: Opened LONG 0.1 XAUUSDT at 2362.45",
+      "mode": "paper"
+    },
+    {
+      "id": "log-2",
+      "timestamp": "2026-07-15T10:52:44.100Z",
+      "rawBody": {
+        "passphrase": "GOLD_ALGO_88",
+        "action": "sell",
+        "symbol": "XAUUSDT",
+        "price": 2368.1,
+        "volume": 0.2,
+        "comment": "TradingView RSI Overbought alert on 5m timeframe"
+      },
+      "status": "success",
+      "action": "sell",
+      "symbol": "XAUUSDT",
+      "price": 2368.1,
+      "quantity": 0.2,
+      "message": "Paper Trade executed successfully: Opened SHORT 0.2 XAUUSDT at 2368.10",
+      "mode": "paper"
+    },
+    {
+      "id": "log-3",
+      "timestamp": "2026-07-15T12:22:44.101Z",
+      "rawBody": {
+        "passphrase": "WRONG_SECRET",
+        "action": "buy",
+        "symbol": "XAUUSDT",
+        "price": 2365.2,
+        "volume": 0.1
+      },
+      "status": "auth_failed",
+      "action": "buy",
+      "symbol": "XAUUSDT",
+      "price": 2365.2,
+      "quantity": 0.1,
+      "message": "Authentication failed: Webhook passphrase does not match configured passphrase.",
+      "mode": "paper"
+    },
+    {
+      "id": "log-4",
+      "timestamp": "2026-07-15T13:22:44.101Z",
+      "rawBody": {
+        "passphrase": "GOLD_ALGO_88",
+        "action": "close",
+        "symbol": "XAUUSDT",
+        "price": 2371.3
+      },
+      "status": "success",
+      "action": "close",
+      "symbol": "XAUUSDT",
+      "price": 2371.3,
+      "quantity": 0.1,
+      "message": "Paper Trade executed successfully: Closed LONG position at 2371.30. Realized PnL: +$8.85",
+      "mode": "paper"
+    }
+  ],
+  "paperAccount": {
+    "balance": 9908.679999999998,
+    "positions": [
+      {
+        "id": "pos-1",
+        "symbol": "XAUUSDT",
+        "side": "sell",
+        "entryPrice": 2368.1,
+        "quantity": 0.2,
+        "leverage": 10,
+        "timestamp": "2026-07-15T10:52:44.101Z"
+      }
+    ]
+  },
+  "trades": [
+    {
+      "id": "rev-trade-hchlsde04",
+      "symbol": "XAUUSDT",
+      "side": "buy",
+      "entryPrice": 1996,
+      "exitPrice": 1990,
+      "quantity": 9.99,
+      "entryTime": "2026-07-15T15:48:48.164Z",
+      "exitTime": "2026-07-15T15:48:48.170Z",
+      "pnl": -59.94,
+      "durationMs": 6,
+      "module": "range",
+      "routerReason": "Mean Reversion basket closed: BASKET_STOP (rungs filled: 3/3)"
+    },
+    {
+      "id": "rev-trade-5avuodf0l",
+      "symbol": "XAUUSDT",
+      "side": "buy",
+      "entryPrice": 1996,
+      "exitPrice": 1990,
+      "quantity": 9.99,
+      "entryTime": "2026-07-15T15:47:56.897Z",
+      "exitTime": "2026-07-15T15:47:56.904Z",
+      "pnl": -59.94,
+      "durationMs": 7,
+      "module": "range",
+      "routerReason": "Mean Reversion basket closed: BASKET_STOP (rungs filled: 3/3)"
+    },
+    {
+      "id": "rev-trade-td2tbaqoe",
+      "symbol": "XAUUSDT",
+      "side": "buy",
+      "entryPrice": 1996,
+      "exitPrice": 1990,
+      "quantity": 9.99,
+      "entryTime": "2026-07-15T15:47:42.309Z",
+      "exitTime": "2026-07-15T15:47:42.315Z",
+      "pnl": -59.94,
+      "durationMs": 6,
+      "module": "range",
+      "routerReason": "Mean Reversion basket closed: BASKET_STOP (rungs filled: 3/3)"
+    },
+    {
+      "id": "trade-1",
+      "symbol": "XAUUSDT",
+      "side": "buy",
+      "entryPrice": 2362.45,
+      "exitPrice": 2371.3,
+      "quantity": 0.1,
+      "leverage": 10,
+      "entryTime": "2026-07-15T10:22:44.101Z",
+      "exitTime": "2026-07-15T13:22:44.101Z",
+      "pnl": 8.85,
+      "durationMs": 10800000
+    },
+    {
+      "id": "trade-2",
+      "symbol": "XAUUSDT",
+      "side": "sell",
+      "entryPrice": 2374.2,
+      "exitPrice": 2365.8,
+      "quantity": 0.15,
+      "leverage": 10,
+      "entryTime": "2026-07-15T06:22:44.101Z",
+      "exitTime": "2026-07-15T09:22:44.101Z",
+      "pnl": 12.6,
+      "durationMs": 10800000
+    },
+    {
+      "id": "trade-3",
+      "symbol": "XAUUSDT",
+      "side": "buy",
+      "entryPrice": 2358,
+      "exitPrice": 2364.5,
+      "quantity": 0.2,
+      "leverage": 10,
+      "entryTime": "2026-07-15T02:22:44.101Z",
+      "exitTime": "2026-07-15T04:22:44.101Z",
+      "pnl": 13,
+      "durationMs": 7200000
+    },
+    {
+      "id": "trade-4",
+      "symbol": "XAUUSDT",
+      "side": "sell",
+      "entryPrice": 2352.1,
+      "exitPrice": 2356.4,
+      "quantity": 0.1,
+      "leverage": 10,
+      "entryTime": "2026-07-14T20:22:44.101Z",
+      "exitTime": "2026-07-14T21:22:44.101Z",
+      "pnl": -4.3,
+      "durationMs": 3600000
+    }
+  ],
+  "mt5Accounts": []
+}

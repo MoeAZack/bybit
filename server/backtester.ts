@@ -1,5 +1,6 @@
 import { ClosedTrade, getContractMultiplier } from './db.js';
 import { BybitClient } from './bybit.js';
+import { calculateBollingerBands, calculateSessionVWAP } from './indicators.js';
 
 function calculateEMA(prices: number[], period: number): number[] {
   const ema: number[] = [];
@@ -223,6 +224,12 @@ export interface StrategyParams {
   isTimeStopActive?: boolean;
   timeStopBars?: number;
   symbol?: string;
+  // Mean Reversion parameters
+  backtestModule?: 'trend' | 'reversion';
+  reversionRiskUsd?: number;
+  reversionMaxRungs?: number;
+  reversionRungSpacingAtr?: number;
+  reversionStopBeyondLastRungAtr?: number;
 }
 
 // Generates highly realistic XAUUSDT price series with simulated indicators including ADX
@@ -381,11 +388,15 @@ export class Backtester {
         console.log(`[Backtester] Successfully ran backtest using ${klines.length} real market candles.`);
       }
     } catch (err: any) {
-      console.warn(`[Backtester] Failed to run with real candles: ${err.message || err}. Falling back to synthetic candles.`);
+      console.warn(`[Backtester] Failed to run with real candles: ${err.message || err}`);
     }
 
     if (!fetchedReal) {
-      klines = generateSyntheticKlines(startDate, endDate, timeframeMins);
+      throw new Error(`[Backtester Error] Historical candle data could not be retrieved from the Bybit public API. To ensure measurement honesty, synthetic fallback simulation is disabled.`);
+    }
+
+    if (params.backtestModule === 'reversion') {
+      return await Backtester.runReversionBacktest(params, klines);
     }
 
     let balance = 10000.0;
@@ -875,6 +886,363 @@ export class Backtester {
       rejectedTradesCount,
       monteCarloMaxDrawdown95,
       rollingExpectancyAlert,
+      trades,
+      dailyCurve,
+    };
+  }
+
+  public static async runReversionBacktest(params: StrategyParams, originalKlines: any[]): Promise<BacktestResult> {
+    const klines = originalKlines;
+    const highs = klines.map(k => k.high);
+    const lows = klines.map(k => k.low);
+    const closes = klines.map(k => k.close);
+
+    // Indicator calculations
+    const rsiArr = calculateRSI(closes, params.rsiPeriod || 14);
+    const bbArr = calculateBollingerBands(closes, 20, 2.0);
+    const atrArr = calculateATR(highs, lows, closes, 14);
+
+    const vwapInput = klines.map(k => ({
+      time: k.time,
+      high: k.high,
+      low: k.low,
+      close: k.close,
+      volume: k.volume || k.vol || 1,
+    }));
+    const vwapArr = calculateSessionVWAP(vwapInput);
+    const adxArr = calculateADXArray(highs, lows, closes, 14);
+
+    let balance = 10000.0;
+    const initialBalance = balance;
+    let maxBalance = balance;
+    let maxDrawdown = 0;
+
+    const trades: BacktestResult['trades'] = [];
+    const dailyBalanceMap: { [dateStr: string]: number } = {};
+
+    let lastDateStr = '';
+    let startOfDayBalance = balance;
+    let dailyLossThisDay = 0;
+    let coolingOffUntil: Date | null = null;
+    let rejectedTradesCount = 0;
+    let totalFeesPaid = 0;
+    let totalSlippagePaid = 0;
+
+    interface BacktestBasket {
+      side: 'BUY' | 'SELL';
+      p0: number;
+      q: number;
+      rungPrices: number[];
+      rungsFilled: boolean[];
+      stopLossPrice: number;
+      tpTargetPrice: number;
+      barsHeld: number;
+      entryTime: Date;
+    }
+
+    let activeBasket: BacktestBasket | null = null;
+
+    for (let i = 30; i < klines.length; i++) {
+      const prev = klines[i - 1];
+      const curr = klines[i];
+      const dateStr = curr.time.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+      if (!dailyBalanceMap[dateStr]) {
+        dailyBalanceMap[dateStr] = balance;
+      }
+
+      const currentDateString = curr.time.toDateString();
+      if (currentDateString !== lastDateStr) {
+        startOfDayBalance = balance;
+        dailyLossThisDay = 0;
+        lastDateStr = currentDateString;
+      }
+
+      // Check news blackout
+      const dayOfWeek = curr.time.getUTCDay();
+      const hour = curr.time.getUTCHours();
+      const min = curr.time.getUTCMinutes();
+      const isNewsBlackoutActive = params.isEventBlackoutActive && (
+        ((dayOfWeek === 1 || dayOfWeek === 3 || dayOfWeek === 5) && hour === 13 && min >= 15 && min <= 45) ||
+        (dayOfWeek === 3 && hour === 19 && min >= 0 && min <= 30)
+      );
+
+      if (activeBasket) {
+        let closed = false;
+        let exitPrice = 0;
+        let closeReason = 'SL';
+        const basket = activeBasket;
+
+        // Blackout event force-flatten
+        if (isNewsBlackoutActive) {
+          closed = true;
+          exitPrice = curr.close;
+          closeReason = 'BLACKOUT_FLATTEN';
+        }
+
+        // Check time stop
+        if (!closed && params.isTimeStopActive && basket.barsHeld >= (params.timeStopBars || 20)) {
+          closed = true;
+          exitPrice = curr.close;
+          closeReason = 'TIME_STOP';
+        }
+
+        if (!closed) {
+          if (basket.side === 'BUY') {
+            // Check Rung fills
+            if (!basket.rungsFilled[1] && curr.low <= basket.rungPrices[1]) {
+              basket.rungsFilled[1] = true;
+            }
+            if (basket.rungPrices[2] && !basket.rungsFilled[2] && curr.low <= basket.rungPrices[2]) {
+              basket.rungsFilled[2] = true;
+            }
+
+            // Check SL
+            if (curr.low <= basket.stopLossPrice) {
+              closed = true;
+              exitPrice = basket.stopLossPrice;
+              closeReason = 'SL';
+            }
+            // Check TP
+            else if (curr.high >= basket.tpTargetPrice) {
+              closed = true;
+              exitPrice = basket.tpTargetPrice;
+              closeReason = 'TP';
+            }
+          } else {
+            // SELL Side basket
+            if (!basket.rungsFilled[1] && curr.high >= basket.rungPrices[1]) {
+              basket.rungsFilled[1] = true;
+            }
+            if (basket.rungPrices[2] && !basket.rungsFilled[2] && curr.high >= basket.rungPrices[2]) {
+              basket.rungsFilled[2] = true;
+            }
+
+            // Check SL
+            if (curr.high >= basket.stopLossPrice) {
+              closed = true;
+              exitPrice = basket.stopLossPrice;
+              closeReason = 'SL';
+            }
+            // Check TP
+            else if (curr.low <= basket.tpTargetPrice) {
+              closed = true;
+              exitPrice = basket.tpTargetPrice;
+              closeReason = 'TP';
+            }
+          }
+        }
+
+        if (closed) {
+          // Flatten basket
+          const filledCount = basket.rungsFilled.filter(f => f).length;
+          const totalQty = filledCount * basket.q;
+
+          // Average entry price calculation
+          let totalEntryValue = 0;
+          for (let r = 0; r < basket.rungsFilled.length; r++) {
+            if (basket.rungsFilled[r]) {
+              totalEntryValue += basket.rungPrices[r] * basket.q;
+            }
+          }
+          const avgEntryPrice = totalEntryValue / totalQty;
+
+          // Slippage
+          let slippageAmount = 0;
+          if (closeReason === 'SL' || closeReason === 'TIME_STOP' || closeReason === 'BLACKOUT_FLATTEN') {
+            slippageAmount = (params.slippageTicks || 1) * 0.05;
+            exitPrice = basket.side === 'BUY' ? (exitPrice - slippageAmount) : (exitPrice + slippageAmount);
+            totalSlippagePaid += slippageAmount * totalQty;
+          }
+
+          const sideMultiplier = basket.side === 'BUY' ? 1 : -1;
+          const grossPnL = sideMultiplier * (exitPrice - avgEntryPrice) * totalQty * getContractMultiplier(params.symbol || 'XAUUSDT');
+
+          const entryValue = avgEntryPrice * totalQty * getContractMultiplier(params.symbol || 'XAUUSDT');
+          const exitValue = exitPrice * totalQty * getContractMultiplier(params.symbol || 'XAUUSDT');
+          const feeRate = params.feePercent / 100;
+          const totalFees = (entryValue + exitValue) * feeRate;
+
+          const finalPnL = grossPnL - totalFees;
+          balance += finalPnL;
+          totalFeesPaid += totalFees;
+
+          if (finalPnL < 0) {
+            dailyLossThisDay += Math.abs(finalPnL);
+          }
+
+          if (balance > maxBalance) maxBalance = balance;
+          const dd = ((maxBalance - balance) / maxBalance) * 100;
+          if (dd > maxDrawdown) maxDrawdown = dd;
+
+          const initialDollarRisk = params.reversionRiskUsd || 100.0;
+          const riskAmountR = finalPnL / initialDollarRisk;
+
+          trades.push({
+            id: 'rev-backtest-' + Math.random().toString(36).substr(2, 9),
+            type: basket.side === 'BUY' ? 'LONG' : 'SHORT',
+            entryPrice: avgEntryPrice,
+            exitPrice,
+            entryTime: basket.entryTime.toISOString(),
+            exitTime: curr.time.toISOString(),
+            pnl: finalPnL,
+            fees: totalFees,
+            slippage: slippageAmount * totalQty,
+            durationMins: Math.floor((curr.time.getTime() - basket.entryTime.getTime()) / 60000),
+            result: finalPnL > 0 ? 'PROFIT' : 'LOSS',
+            riskAmountR,
+            exitReason: closeReason,
+          });
+
+          activeBasket = null;
+        } else {
+          basket.barsHeld++;
+
+          // Dynamic TP adjustment
+          let newTpPrice = basket.tpTargetPrice;
+          if (params.slowEma === 999) { // custom indicator of tp target
+            newTpPrice = Number(bbArr[i].middle.toFixed(2));
+          } else {
+            newTpPrice = Number(vwapArr[i].toFixed(2));
+          }
+          const drift = Math.abs(basket.tpTargetPrice - newTpPrice);
+          if (drift > 0.25 * atrArr[i]) {
+            basket.tpTargetPrice = newTpPrice;
+          }
+        }
+      }
+
+      if (!activeBasket) {
+        // Daily loss limit
+        const isDailyLossLimitExceeded = params.isEquityThrottleActive && dailyLossThisDay >= (startOfDayBalance * 0.02);
+        if (isDailyLossLimitExceeded) {
+          rejectedTradesCount++;
+          continue;
+        }
+
+        // Trigger signal evaluation
+        const configRiskUsd = params.reversionRiskUsd || 100.0;
+        const configMaxRungs = params.reversionMaxRungs || 3;
+        const configSpacing = params.reversionRungSpacingAtr || 1.0;
+        const configStopBeyond = params.reversionStopBeyondLastRungAtr || 1.5;
+
+        const currentAdx = adxArr[i];
+        if (currentAdx >= (params.adxThreshold || 22)) {
+          continue; // Regime filter blocked (market trending)
+        }
+
+        // Triple confirmation
+        const lastRsi = rsiArr[i];
+        const lastBb = bbArr[i];
+        const lastAtr = atrArr[i];
+        const lastVwap = vwapArr[i];
+
+        const rsiLong = lastRsi < (params.rsiOversold || 25);
+        const rsiShort = lastRsi > (params.rsiOverbought || 75);
+        const bbLong = lastBb.pctB <= 0;
+        const bbShort = lastBb.pctB >= 1;
+        const isVwapStretched = Math.abs(curr.close - lastVwap) > (configSpacing * lastAtr);
+
+        let signalSide: 'BUY' | 'SELL' | null = null;
+        if (rsiLong && bbLong && isVwapStretched) {
+          signalSide = 'BUY';
+        } else if (rsiShort && bbShort && isVwapStretched) {
+          signalSide = 'SELL';
+        }
+
+        if (signalSide) {
+          const d = configSpacing * lastAtr;
+          const s = configStopBeyond * lastAtr;
+          const m = getContractMultiplier(params.symbol || 'XAUUSDT');
+
+          let q = 0;
+          if (configMaxRungs === 3) {
+            q = configRiskUsd / (m * 3 * (d + s));
+          } else if (configMaxRungs === 2) {
+            q = configRiskUsd / (m * (d + 2 * s));
+          } else {
+            q = configRiskUsd / (m * s);
+          }
+
+          const qtyStep = 0.01;
+          q = Math.floor(q / qtyStep) * qtyStep;
+
+          if (q < 0.01) {
+            rejectedTradesCount++;
+            continue;
+          }
+
+          const rungPrices: number[] = [];
+          let stopLossPrice = 0;
+
+          if (signalSide === 'BUY') {
+            for (let r = 0; r < configMaxRungs; r++) {
+              rungPrices.push(Number((curr.close - r * d).toFixed(2)));
+            }
+            stopLossPrice = Number((curr.close - ((configMaxRungs - 1) * d + s)).toFixed(2));
+          } else {
+            for (let r = 0; r < configMaxRungs; r++) {
+              rungPrices.push(Number((curr.close + r * d).toFixed(2)));
+            }
+            stopLossPrice = Number((curr.close + ((configMaxRungs - 1) * d + s)).toFixed(2));
+          }
+
+          // Initial TP
+          const tpTargetPrice = Number(lastBb.middle.toFixed(2));
+
+          activeBasket = {
+            side: signalSide,
+            p0: curr.close,
+            q,
+            rungPrices,
+            rungsFilled: [true, false, false], // Rung 1 fills immediately
+            stopLossPrice,
+            tpTargetPrice,
+            barsHeld: 0,
+            entryTime: curr.time,
+          };
+        }
+      }
+
+      dailyBalanceMap[dateStr] = balance;
+    }
+
+    // Return stats
+    const totalTrades = trades.length;
+    const winningTrades = trades.filter((t) => t.pnl > 0).length;
+    const losingTrades = totalTrades - winningTrades;
+    const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0;
+    const totalProfit = trades.filter((t) => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
+    const totalLoss = Math.abs(trades.filter((t) => t.pnl < 0).reduce((sum, t) => sum + t.pnl, 0));
+    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit;
+    const expectancy = totalTrades > 0 ? (totalProfit - totalLoss) / totalTrades : 0;
+    const rValues = trades.map(t => t.riskAmountR || 0);
+    const expectancyR = rValues.length > 0 ? rValues.reduce((sum, r) => sum + r, 0) / rValues.length : 0;
+
+    const dailyCurve = Object.keys(dailyBalanceMap).map((date) => ({
+      date,
+      balance: Math.round(dailyBalanceMap[date] * 100) / 100,
+    }));
+
+    return {
+      totalTrades,
+      winningTrades,
+      losingTrades,
+      winRate,
+      profitFactor,
+      initialBalance,
+      finalBalance: balance,
+      totalPnL: balance - initialBalance,
+      maxDrawdownPercent: maxDrawdown,
+      kellyCriterion: 0,
+      expectancy,
+      expectancyR,
+      marRatio: maxDrawdown > 0 ? ((balance - initialBalance) / initialBalance) * 100 / maxDrawdown : 0,
+      totalFeesPaid,
+      totalSlippagePaid,
+      rejectedTradesCount,
+      monteCarloMaxDrawdown95: maxDrawdown,
+      rollingExpectancyAlert: false,
       trades,
       dailyCurve,
     };

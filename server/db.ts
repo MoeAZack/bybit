@@ -28,6 +28,33 @@ export interface PaperPosition {
   routerReason?: string;
 }
 
+export interface ReversionSettings {
+  enabled: boolean;              // default false — earns its slot via backtest first
+  symbol: string;                // 'XAUUSDT'
+  timeframe: string;             // '15' (minutes)
+  // regime gate
+  adxPeriod: number;             // 14
+  adxRangeThreshold: number;     // 20 — module active ONLY when ADX < this
+  // signal (all three must agree on the same confirmed candle)
+  rsiPeriod: number;             // 14
+  rsiLongBelow: number;          // 25
+  rsiShortAbove: number;         // 75
+  bbPeriod: number;              // 20
+  bbStdDev: number;              // 2
+  // long requires %B <= 0; short requires %B >= 1
+  vwapStretchAtr: number;        // 1.5 — |price − sessionVWAP| must exceed this × ATR(14)
+  // ladder
+  maxRungs: number;              // 3 (HARD CAP — reject any config > 3)
+  rungSpacingAtr: number;        // 0.75 — distance between rungs in ATR
+  // risk
+  basketRiskUsd: number;         // 75 — TOTAL loss if basket stop hits, all rungs filled
+  stopBeyondLastRungAtr: number; // 1.0 — basket stop distance past rung 3 price
+  // exits
+  tpTarget: 'vwap' | 'bbMid';    // 'bbMid'
+  timeStopBars: number;          // 16 (= 4 hours on 15m): flatten if TP not reached
+  maxSpreadUsd: number;          // 0.60 — skip signal if spread wider (fail CLOSED)
+}
+
 export interface TradingSettings {
   bybitApiKey: string;
   bybitApiSecret: string;
@@ -61,6 +88,7 @@ export interface TradingSettings {
   consecutiveLossDownscale: number;
   maxSpreadUsd: number;
   isRolloverFilterActive: boolean;
+  reversion: ReversionSettings;
   // MT5 Prop-Firm settings
   activeBroker: 'bybit' | 'mt5';
   mt5Host: string;
@@ -161,6 +189,26 @@ const defaultDb: DbSchema = {
     consecutiveLossDownscale: 0.50,
     maxSpreadUsd: 0.80,
     isRolloverFilterActive: true,
+    reversion: {
+      enabled: false,
+      symbol: 'XAUUSDT',
+      timeframe: '15',
+      adxPeriod: 14,
+      adxRangeThreshold: 20,
+      rsiPeriod: 14,
+      rsiLongBelow: 25,
+      rsiShortAbove: 75,
+      bbPeriod: 20,
+      bbStdDev: 2,
+      vwapStretchAtr: 1.5,
+      maxRungs: 3,
+      rungSpacingAtr: 0.75,
+      basketRiskUsd: 75,
+      stopBeyondLastRungAtr: 1.0,
+      tpTarget: 'bbMid',
+      timeStopBars: 16,
+      maxSpreadUsd: 0.60,
+    },
     activeBroker: 'bybit',
     mt5Host: 'http://localhost:5000',
     mt5Login: '',
@@ -335,6 +383,11 @@ export class Database {
       const parsed = JSON.parse(content);
       // Migrate / merge default settings properties if missing
       parsed.settings = { ...defaultDb.settings, ...parsed.settings };
+      if (!parsed.settings.reversion) {
+        parsed.settings.reversion = { ...defaultDb.settings.reversion };
+      } else {
+        parsed.settings.reversion = { ...defaultDb.settings.reversion, ...parsed.settings.reversion };
+      }
       if (!parsed.trades) {
         parsed.trades = [];
       }
