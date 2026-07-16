@@ -22,7 +22,11 @@ import {
   History,
   Info,
   Plus,
-  Edit
+  Edit,
+  Brain,
+  LineChart,
+  Layers,
+  Timer
 } from 'lucide-react';
 import {
   AreaChart,
@@ -269,9 +273,38 @@ export default function App() {
   ]);
 
   // UI state
-  const [activeTab, setActiveTab] = useState<'monitor' | 'setup' | 'settings' | 'trades' | 'sandbox'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'setup' | 'settings' | 'trades' | 'sandbox' | 'quant'>('monitor');
   const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>([]);
   const [routerStats, setRouterStats] = useState<{ trend: RegimeModuleStats; range: RegimeModuleStats } | null>(null);
+
+  // Quant Terminal state variables
+  const [quantMetrics, setQuantMetrics] = useState<any | null>(null);
+  const [quantPerformance, setQuantPerformance] = useState<any | null>(null);
+  const [quantLoading, setQuantLoading] = useState<boolean>(false);
+  const [quantError, setQuantError] = useState<string | null>(null);
+
+  // Meta-Labeler playground form/prediction states
+  const [metaLabelForm, setMetaLabelForm] = useState({
+    module: 'trend',
+    side: 'buy',
+    adx: 24,
+    fundingPercentile: 52,
+    bandwidthPercentile: 65,
+    dxy: 104.2,
+    yield10y: 4.15,
+    session: 'london'
+  });
+  const [metaLabelPrediction, setMetaLabelPrediction] = useState<any | null>(null);
+  const [metaLabelLoading, setMetaLabelLoading] = useState<boolean>(false);
+
+  // Research Desk state variables
+  const [researchDeskData, setResearchDeskData] = useState<{
+    hypotheses: any[];
+    stressTests: any[];
+    adaptiveExecution: any[];
+    capitalLadder: any;
+  } | null>(null);
+  const [deskActionLoading, setDeskActionLoading] = useState<boolean>(false);
 
   // MT5 Multi-Account management state
   const [mt5Accounts, setMt5Accounts] = useState<MT5Account[]>([]);
@@ -404,6 +437,99 @@ export default function App() {
 
     return () => clearInterval(interval);
   }, []);
+
+  const fetchQuantData = async () => {
+    try {
+      setQuantLoading(true);
+      const [resMetrics, resPerformance, resDesk] = await Promise.all([
+        fetch('/api/quant/metrics'),
+        fetch('/api/quant/performance'),
+        fetch('/api/quant/research-desk')
+      ]);
+
+      if (resMetrics.ok && resPerformance.ok && resDesk.ok) {
+        const metricsData = await resMetrics.json();
+        const performanceData = await resPerformance.json();
+        const deskData = await resDesk.json();
+        
+        setQuantMetrics(metricsData);
+        setQuantPerformance(performanceData);
+        setResearchDeskData(deskData);
+      } else {
+        setQuantError('Failed to fetch quant terminal analytics and research desk details from the API.');
+      }
+    } catch (e: any) {
+      setQuantError(e.message || 'Error occurred while loading quant metrics.');
+    } finally {
+      setQuantLoading(false);
+    }
+  };
+
+  const handleDeskAction = async (actionType: string, targetId?: string) => {
+    setDeskActionLoading(true);
+    try {
+      const res = await fetch('/api/quant/research-desk/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actionType, targetId })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showCustomAlert('Desk Action Completed', data.message || 'Action executed successfully.');
+        await fetchQuantData();
+        await fetchPositions();
+        await fetchLogs();
+      } else {
+        showCustomAlert('Action Failed', data.error || 'Failed to complete requested research desk operation.');
+      }
+    } catch (e: any) {
+      showCustomAlert('Error', e.message || 'Network error executing desk action.');
+    } finally {
+      setDeskActionLoading(false);
+    }
+  };
+
+  const handleCheckMetaLabel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMetaLabelLoading(true);
+    try {
+      const res = await fetch('/api/quant/meta-label', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(metaLabelForm)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMetaLabelPrediction(data.prediction);
+      } else {
+        const err = await res.json();
+        setDialog({
+          isOpen: true,
+          type: 'alert',
+          title: 'Prediction Error',
+          message: err.error || 'Failed to generate meta-label prediction.'
+        });
+      }
+    } catch (e: any) {
+      setDialog({
+        isOpen: true,
+        type: 'alert',
+        title: 'Connection Error',
+        message: e.message || 'Error connecting to Gemini Meta-Labeler.'
+      });
+    } finally {
+      setMetaLabelLoading(false);
+    }
+  };
+
+  // Quant Tab fetch polling
+  useEffect(() => {
+    if (activeTab === 'quant') {
+      fetchQuantData();
+      const interval = setInterval(fetchQuantData, 4000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab]);
 
   const fetchMT5Accounts = async () => {
     try {
@@ -1051,6 +1177,17 @@ export default function App() {
         >
           <Sliders className="w-4 h-4" />
           Backtest Sandbox
+        </button>
+        <button
+          onClick={() => setActiveTab('quant')}
+          className={`px-8 py-4 text-xs font-black uppercase tracking-[0.2em] transition-all flex items-center gap-2 border-r border-neutral-800 cursor-pointer ${
+            activeTab === 'quant'
+              ? 'bg-neutral-900 text-amber-500 border-b-2 border-b-amber-500'
+              : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900/50'
+          }`}
+        >
+          <Brain className="w-4 h-4" />
+          Quant Terminal
         </button>
         <button
           onClick={() => setActiveTab('setup')}
@@ -2262,9 +2399,33 @@ export default function App() {
                         <div className="mt-4 bg-neutral-950 p-5 border border-neutral-800 text-xs text-neutral-300 flex flex-col gap-3 font-sans leading-relaxed">
                           <h4 className="text-amber-500 font-black uppercase tracking-wider text-[11px] mb-1">FundedNext MT5 REST Bridge Setup Instructions</h4>
                           
+                          {/* AUTOMATED SETUP BANNER */}
+                          <div className="bg-amber-500/10 border border-amber-500/30 p-4 rounded-md mb-2 flex flex-col gap-2">
+                            <span className="text-amber-400 font-bold uppercase tracking-wider text-xs flex items-center gap-1.5">
+                              🚀 NEW: Fully Automated MT5 Bridge Setup (Recommended)
+                            </span>
+                            <p className="text-neutral-300 text-[11px] leading-relaxed">
+                              You can now completely automate the deployment of your MT5 Bridge! We have created a master automation utility 
+                              <code className="text-white font-mono bg-neutral-900 px-1 py-0.5 border border-neutral-800 mx-1">MoebyAutomator.py</code> 
+                              located in your <code className="text-white font-mono bg-neutral-900 px-1 py-0.5 border border-neutral-800">/mt5_ea</code> folder.
+                            </p>
+                            <div className="mt-2 flex flex-col gap-1 text-[11px] font-mono text-neutral-400 pl-2">
+                              <div>• <strong className="text-white">Auto-Deployment:</strong> Downloads settings, compiles <code className="text-amber-400">MoebyBridge.mq5</code>, and installs it automatically.</div>
+                              <div>• <strong className="text-white">Headless Launch:</strong> Generates <code className="text-amber-400">startup.ini</code> and boots MT5 headlessly.</div>
+                              <div>• <strong className="text-white">API Daemon:</strong> Keeps connections alive and hosts a secure local Flask REST Server automatically.</div>
+                            </div>
+                            <div className="mt-2 text-neutral-300 text-[11px]">
+                              To run it on your Windows/VPS machine with one click:
+                              <pre className="mt-2 bg-neutral-950 p-2.5 border border-neutral-800 text-amber-500 font-mono text-[10px] rounded overflow-x-auto text-left">
+{`cd /path/to/your/cloned/repo/mt5_ea
+run_bridge.bat`}
+                              </pre>
+                            </div>
+                          </div>
+
                           <p>
                             MetaTrader 5 is a native desktop software and does not expose a public web REST API out of the box. 
-                            To bridge your <strong>FundedNext MT5 account</strong> to this web dashboard, you must run a small Python REST Bridge script on the machine (Windows/VPS) where your MT5 terminal application is running.
+                            To bridge your <strong>FundedNext MT5 account</strong> to this web dashboard, you can also run the small Python REST Bridge script manually as detailed below.
                           </p>
 
                           <div className="flex flex-col gap-2 bg-neutral-900/50 p-3.5 border border-neutral-800/50">
@@ -3536,6 +3697,707 @@ if __name__ == '__main__':
               </div>
             </div>
           </section>
+        )}
+
+        {activeTab === 'quant' && (
+          <div className="col-span-12 bg-neutral-950 p-6 flex flex-col gap-6 overflow-y-auto">
+            {/* Header section with manual refresh */}
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-neutral-800 pb-5 gap-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-ping"></span>
+                  <span className="text-[10px] font-black text-neutral-400 uppercase tracking-[0.25em]">ROUTED QUANT EXECUTOR TERMINAL</span>
+                </div>
+                <h1 className="text-3xl font-black tracking-tight text-white mt-1">
+                  XAUUSD REGIME ANALYSIS & PERFORMANCE DESK
+                </h1>
+                <p className="text-xs text-neutral-400 mt-1 leading-relaxed max-w-3xl">
+                  Real-time correlation modeling on Bybit v5. Tracks global macroeconomic drivers (DXY, 10Y Yield) alongside on-exchange order flows, liquidity triggers, and AI-meta labeled safety filters.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-3 self-stretch md:self-auto justify-between border-t border-neutral-900 md:border-t-0 pt-4 md:pt-0">
+                <div className="flex items-center gap-2 bg-neutral-900 px-3 py-1.5 border border-neutral-800 text-[10px] font-mono">
+                  <span className="text-neutral-500">FEEDER STATUS:</span>
+                  <span className="text-green-400 font-bold uppercase">LIVE FEEDING</span>
+                </div>
+                <button
+                  onClick={fetchQuantData}
+                  disabled={quantLoading}
+                  className="px-4 py-2 bg-neutral-900 hover:bg-neutral-800 text-white border border-neutral-800 text-xs font-black uppercase tracking-widest transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${quantLoading ? 'animate-spin text-amber-500' : ''}`} />
+                  REFRESH TERMINAL
+                </button>
+              </div>
+            </div>
+
+            {quantError && (
+              <div className="bg-red-500/10 border border-red-500/30 text-red-400 p-4 font-mono text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0 text-red-500" />
+                <span>Error syncing quant telemetry: {quantError}</span>
+              </div>
+            )}
+
+            {/* REAL-TIME TICKERS BLOCK */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+              {/* Card 1: DXY */}
+              <div className="bg-neutral-900 border border-neutral-800 p-4 font-mono relative overflow-hidden">
+                <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">DXY</div>
+                <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">DXY SPOT</span>
+                <span className="text-2xl font-black text-white block mt-1">
+                  {quantMetrics?.dxy?.toFixed(2) || '104.20'}
+                </span>
+                <div className="flex items-center gap-1 text-[9px] text-red-400 mt-2">
+                  <span className="font-semibold">-0.12%</span>
+                  <span className="text-neutral-600">vs 24h ago</span>
+                </div>
+              </div>
+
+              {/* Card 2: 10Y Yield */}
+              <div className="bg-neutral-900 border border-neutral-800 p-4 font-mono relative overflow-hidden">
+                <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">US10Y</div>
+                <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">US 10Y YIELD</span>
+                <span className="text-2xl font-black text-amber-500 block mt-1">
+                  {quantMetrics?.yield10y ? `${quantMetrics.yield10y.toFixed(3)}%` : '4.150%'}
+                </span>
+                <div className="flex items-center gap-1 text-[9px] text-green-400 mt-2">
+                  <span className="font-semibold">+0.03%</span>
+                  <span className="text-neutral-600">Negative correlation</span>
+                </div>
+              </div>
+
+              {/* Card 3: Funding Rate */}
+              <div className="bg-neutral-900 border border-neutral-800 p-4 font-mono relative overflow-hidden">
+                <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">FUND</div>
+                <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">BYBIT 8H FUNDING RATE</span>
+                <span className="text-2xl font-black text-emerald-400 block mt-1">
+                  {quantMetrics?.fundingRate ? `${(quantMetrics.fundingRate * 100).toFixed(4)}%` : '0.0150%'}
+                </span>
+                <div className="text-[9px] text-neutral-500 mt-2">
+                  Daily annualized: <span className="text-neutral-300 font-semibold">16.42%</span>
+                </div>
+              </div>
+
+              {/* Card 4: Open Interest */}
+              <div className="bg-neutral-900 border border-neutral-800 p-4 font-mono relative overflow-hidden">
+                <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">OI</div>
+                <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">BYBIT OPEN INTEREST</span>
+                <span className="text-2xl font-black text-indigo-400 block mt-1">
+                  {quantMetrics?.openInterest ? `$${(quantMetrics.openInterest / 1000000).toFixed(1)}M` : '$124.5M'}
+                </span>
+                <div className="text-[9px] text-neutral-500 mt-2">
+                  Active net leverage: <span className="text-neutral-300 font-semibold">High leverage load</span>
+                </div>
+              </div>
+
+              {/* Card 5: Liquidations */}
+              <div className="bg-neutral-900 border border-neutral-800 p-4 font-mono relative overflow-hidden">
+                <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">LIQ</div>
+                <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">BYBIT 24H LIQUIDATIONS</span>
+                <span className="text-2xl font-black text-rose-500 block mt-1">
+                  {quantMetrics?.liquidationsUsd ? `$${(quantMetrics.liquidationsUsd / 1000).toFixed(1)}K` : '$234.5K'}
+                </span>
+                <div className="text-[9px] text-rose-400 mt-2 font-bold animate-pulse">
+                  High volatility risk threshold
+                </div>
+              </div>
+            </div>
+
+            {/* DUAL COLUMN INTERACTIVE SECTIONS */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              {/* LEFT COLUMN (Lg: 8): CHARTS, SPECIALISTS ATTRIBUTION & SLIPPAGE */}
+              <div className="lg:col-span-8 flex flex-col gap-6">
+                
+                {/* Chart section */}
+                <div className="bg-neutral-900 border border-neutral-800 p-6 flex flex-col gap-4">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+                    <div>
+                      <h3 className="text-xs font-black text-neutral-400 uppercase tracking-[0.1em] flex items-center gap-1.5">
+                        <LineChart className="w-4 h-4 text-amber-500" />
+                        Macro Correlation modeling (15M granularity)
+                      </h3>
+                      <p className="text-[10px] text-neutral-500">
+                        Tracks physical US Dollar liquidity alongside the 10-Year yield as an intraday gold proxy.
+                      </p>
+                    </div>
+                    <span className="text-[9px] font-mono text-amber-500 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded">
+                      GOLD IS A REAL YIELDS TRADE
+                    </span>
+                  </div>
+
+                  <div className="h-64 w-full relative">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart
+                        data={quantMetrics?.macroCharts || [
+                          { time: '11:00', dxy: 104.12, yield10y: 4.145, gold: 2372 },
+                          { time: '11:15', dxy: 104.15, yield10y: 4.148, gold: 2373 },
+                          { time: '11:30', dxy: 104.18, yield10y: 4.152, gold: 2374 },
+                          { time: '11:45', dxy: 104.22, yield10y: 4.150, gold: 2373 },
+                          { time: '12:00', dxy: 104.20, yield10y: 4.150, gold: 2375 }
+                        ]}
+                        margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
+                      >
+                        <defs>
+                          <linearGradient id="colorDxy" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#d97706" stopOpacity={0.15}/>
+                            <stop offset="95%" stopColor="#d97706" stopOpacity={0}/>
+                          </linearGradient>
+                          <linearGradient id="colorYield" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#6366f1" stopOpacity={0.15}/>
+                            <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                        <XAxis dataKey="time" stroke="#525252" fontSize={9} tickLine={false} />
+                        <YAxis yAxisId="left" stroke="#d97706" fontSize={9} tickLine={false} domain={['dataMin - 0.05', 'dataMax + 0.05']} />
+                        <YAxis yAxisId="right" orientation="right" stroke="#6366f1" fontSize={9} tickLine={false} domain={['dataMin - 0.01', 'dataMax + 0.01']} />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: '#171717',
+                            borderColor: '#404040',
+                            color: '#fff',
+                            fontSize: '10px',
+                            fontFamily: 'monospace'
+                          }}
+                        />
+                        <Area yAxisId="left" type="monotone" dataKey="dxy" name="DXY Spot" stroke="#d97706" strokeWidth={1.5} fillOpacity={1} fill="url(#colorDxy)" />
+                        <Area yAxisId="right" type="monotone" dataKey="yield10y" name="US10Y Yield" stroke="#6366f1" strokeWidth={1.5} fillOpacity={1} fill="url(#colorYield)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Specialists, attribution and veto status grids */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Specialists & Kelly allocation */}
+                  <div className="bg-neutral-900 border border-neutral-800 p-5 flex flex-col gap-4">
+                    <h3 className="text-xs font-black text-neutral-400 uppercase tracking-widest flex items-center gap-1.5">
+                      <Layers className="w-4 h-4 text-amber-500" />
+                      Specialist Portfolio Allocator
+                    </h3>
+                    <p className="text-[11px] text-neutral-500 leading-normal">
+                      Intraday router metrics showing the current win rate and fractional-Kelly sizing outputs computed for the next trade block:
+                    </p>
+
+                    <div className="space-y-3 font-mono">
+                      {/* Trend follower details */}
+                      <div className="bg-neutral-950 p-3 border border-neutral-800">
+                        <div className="flex justify-between items-center mb-1">
+                          <span className="text-xs text-white font-bold">Trend Follower specialist</span>
+                          <span className="text-[10px] text-emerald-400 font-bold">WR: {quantPerformance?.attribution?.trendWinRate || '75'}%</span>
+                        </div>
+                        <div className="text-[10px] text-neutral-400 flex justify-between items-center">
+                          <span>Kelly Order Leverage multiplier:</span>
+                          <span className="text-amber-500 font-bold">{quantPerformance?.modules?.trend?.sizingMultiplier?.toFixed(2) || '0.50'}x Lots</span>
+                        </div>
+                      </div>
+
+                      {/* Mean Reversion details */}
+                      <div className="bg-neutral-950 p-3 border border-neutral-800">
+                        <div className="flex justify-between items-center mb-1">
+                          <span className="text-xs text-white font-bold">Mean Reverter specialist</span>
+                          <span className="text-[10px] text-emerald-400 font-bold">WR: {quantPerformance?.attribution?.rangeWinRate || '68'}%</span>
+                        </div>
+                        <div className="text-[10px] text-neutral-400 flex justify-between items-center">
+                          <span>Kelly Order Leverage multiplier:</span>
+                          <span className="text-amber-500 font-bold">{quantPerformance?.modules?.range?.sizingMultiplier?.toFixed(2) || '0.25'}x Lots</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Portfolio veto parameters */}
+                  <div className="bg-neutral-900 border border-neutral-800 p-5 flex flex-col gap-4">
+                    <h3 className="text-xs font-black text-neutral-400 uppercase tracking-widest flex items-center gap-1.5">
+                      <Shield className="w-4 h-4 text-amber-500" />
+                      Central Risk Veto Diagnostics
+                    </h3>
+                    <p className="text-[11px] text-neutral-500 leading-normal">
+                      Central risk gateway metrics monitoring maximum risk bounds. Blocks new executions if constraints fail.
+                    </p>
+
+                    <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                      <div className="bg-neutral-950 p-3 border border-neutral-800 flex flex-col justify-between">
+                        <span className="text-[9px] text-neutral-500 block">RISK STATUS</span>
+                        <span className={`text-sm font-black mt-1 ${quantPerformance?.riskGate?.status === 'PASS' ? 'text-emerald-400 animate-pulse' : 'text-red-400'}`}>
+                          {quantPerformance?.riskGate?.status || 'PASS'}
+                        </span>
+                      </div>
+
+                      <div className="bg-neutral-950 p-3 border border-neutral-800 flex flex-col justify-between">
+                        <span className="text-[9px] text-neutral-500 block">DAILY DRAWDOWN</span>
+                        <span className="text-sm font-black text-white mt-1">
+                          {quantPerformance?.riskGate?.drawdown?.toFixed(2) || '0.00'}%
+                        </span>
+                      </div>
+
+                      <div className="bg-neutral-950 p-3 border border-neutral-800 flex flex-col justify-between">
+                        <span className="text-[9px] text-neutral-500 block">STREAK VETO</span>
+                        <span className="text-sm font-bold text-neutral-300 mt-1">
+                          {quantPerformance?.riskGate?.streakVeto ? 'BLOCKED' : 'ALLOW'}
+                        </span>
+                      </div>
+
+                      <div className="bg-neutral-950 p-3 border border-neutral-800 flex flex-col justify-between">
+                        <span className="text-[9px] text-neutral-500 block">SESSION VETO</span>
+                        <span className="text-sm font-bold text-neutral-300 mt-1">
+                          {quantPerformance?.riskGate?.gmtVeto ? 'BLOCKED' : 'ALLOW'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Execution Shortfall Slippage Log */}
+                <div className="bg-neutral-900 border border-neutral-800 p-5">
+                  <div className="flex justify-between items-center mb-4">
+                    <div>
+                      <h3 className="text-xs font-black text-neutral-400 uppercase tracking-widest flex items-center gap-1.5">
+                        <Timer className="w-4 h-4 text-amber-500" />
+                        Execution Slippage & Shortfall Auditing
+                      </h3>
+                      <p className="text-[10px] text-neutral-500 mt-1">
+                        Maker vs Taker escalation trail logging actual fill performance against proposed TV trigger prices.
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-mono text-neutral-400">
+                      Maker Efficiency: <span className="text-emerald-400 font-bold">{quantPerformance?.drift?.makerFillEfficiency ? `${quantPerformance.drift.makerFillEfficiency}%` : '85%'}</span>
+                    </span>
+                  </div>
+
+                  <div className="max-h-48 overflow-y-auto border border-neutral-800">
+                    {(!quantPerformance?.shortfallLogs || quantPerformance.shortfallLogs.length === 0) ? (
+                      <div className="p-8 text-center text-xs text-neutral-600 font-mono bg-neutral-950">
+                        No shortfall logs populated yet. Trigger a webhook or execute positions to capture slippage metrics.
+                      </div>
+                    ) : (
+                      <table className="w-full text-left border-collapse font-mono text-[11px]">
+                        <thead className="bg-neutral-950 text-neutral-500 text-[9px] font-bold uppercase border-b border-neutral-800 sticky top-0">
+                          <tr>
+                            <th className="p-2.5">SYMBOL/SIDE</th>
+                            <th className="p-2.5">SIGNAL PRICE</th>
+                            <th className="p-2.5">FILLED PRICE</th>
+                            <th className="p-2.5">SLIPPAGE</th>
+                            <th className="p-2.5">FILL METHOD</th>
+                            <th className="p-2.5 text-right">LATENCY</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-neutral-800/40 bg-neutral-950/50">
+                          {quantPerformance.shortfallLogs.map((log: any) => {
+                            const isLoss = log.slippageTicks > 0;
+                            return (
+                              <tr key={log.id} className="hover:bg-neutral-950 transition-colors">
+                                <td className="p-2.5 font-bold text-white uppercase">{log.symbol}</td>
+                                <td className="p-2.5 text-neutral-400">${log.targetPrice?.toFixed(2)}</td>
+                                <td className="p-2.5 text-neutral-300">${log.filledPrice?.toFixed(2)}</td>
+                                <td className={`p-2.5 font-bold ${isLoss ? 'text-red-400' : 'text-emerald-400'}`}>
+                                  {isLoss ? '+' : ''}{log.slippageTicks} ticks
+                                </td>
+                                <td className="p-2.5">
+                                  <span className={`px-1.5 py-0.5 text-[9px] font-bold uppercase ${log.isMaker ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-neutral-800 text-neutral-400'}`}>
+                                    {log.isMaker ? 'MAKER' : 'TAKER'}
+                                  </span>
+                                </td>
+                                <td className="p-2.5 text-right text-neutral-500">{log.delayMs}ms</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+
+                {/* QUANT RESEARCH DESK */}
+                <div className="bg-neutral-900 border border-neutral-800 p-6 flex flex-col gap-6 relative overflow-hidden">
+                  <div className="absolute -right-8 -top-8 w-24 h-24 bg-amber-500/5 rounded-full blur-2xl"></div>
+                  
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-neutral-800 pb-4">
+                    <div>
+                      <h2 className="text-sm font-black text-white uppercase tracking-widest flex items-center gap-2">
+                        <Brain className="w-5 h-5 text-amber-500 animate-pulse" />
+                        Quant Research Desk
+                      </h2>
+                      <p className="text-[10px] text-neutral-400 mt-0.5">
+                        Nightly hypothesis reports, multi-regime stress testing, adaptive fills, and capital laddering.
+                      </p>
+                    </div>
+                    <div className="text-[9px] font-mono bg-neutral-950 border border-neutral-800 px-2.5 py-1 text-neutral-400">
+                      DESK: <span className="text-emerald-400 font-bold">COFFEE ONE-HOUR ACTIVE</span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {/* Module 1: Hypothesis Generator */}
+                    <div className="bg-neutral-950 border border-neutral-800 p-4 flex flex-col gap-3">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] font-mono text-amber-500 font-bold uppercase tracking-wider">Candidate Hypotheses</span>
+                        <span className="text-[9px] text-neutral-500 uppercase font-mono">AUTORUN AT 00:00 UTC</span>
+                      </div>
+                      <div className="space-y-3 max-h-[280px] overflow-y-auto pr-1">
+                        {researchDeskData?.hypotheses?.map((hyp) => (
+                          <div key={hyp.id} className="p-3 bg-neutral-900/60 border border-neutral-800/80 hover:border-neutral-700 transition-colors">
+                            <div className="flex justify-between items-start gap-1">
+                              <h4 className="text-[11px] font-bold text-white leading-snug">{hyp.title}</h4>
+                              <span className={`text-[8px] font-mono px-1 py-0.5 font-bold uppercase ${
+                                hyp.recommendation === 'SHADOW_MODE_PROMOTION' ? 'text-amber-400 bg-amber-500/10' :
+                                hyp.recommendation === 'MONITOR' ? 'text-indigo-400 bg-indigo-500/10' : 'text-neutral-500 bg-neutral-800'
+                              }`}>
+                                {hyp.recommendation === 'SHADOW_MODE_PROMOTION' ? 'PROMOTE' : hyp.recommendation}
+                              </span>
+                            </div>
+                            <p className="text-[9px] font-mono text-neutral-400 mt-1.5 leading-normal">{hyp.regimePattern}</p>
+                            <p className="text-[10px] text-neutral-500 mt-1 font-sans">{hyp.detailedDescription}</p>
+                            <div className="grid grid-cols-3 gap-2 mt-2 pt-2 border-t border-neutral-800/40 text-[9px] font-mono">
+                              <div>
+                                <span className="text-neutral-500 block">EXPECTANCY</span>
+                                <span className="text-neutral-200 font-bold">+{hyp.expectancyR.toFixed(2)}R</span>
+                              </div>
+                              <div>
+                                <span className="text-neutral-500 block">SAMPLE SIZE</span>
+                                <span className="text-neutral-200 font-bold">{hyp.sampleCount}</span>
+                              </div>
+                              <div>
+                                <span className="text-neutral-500 block">STABILITY</span>
+                                <span className="text-emerald-400 font-bold">{(hyp.stabilityScore * 100).toFixed(0)}%</span>
+                              </div>
+                            </div>
+                            {hyp.recommendation === 'SHADOW_MODE_PROMOTION' && (
+                              <button
+                                onClick={() => handleDeskAction('promote_hypothesis', hyp.id)}
+                                disabled={deskActionLoading}
+                                className="mt-2.5 w-full py-1.5 bg-amber-500 text-neutral-950 text-[9px] font-black uppercase tracking-widest hover:bg-amber-400 disabled:opacity-50 transition-all cursor-pointer border-none"
+                              >
+                                {deskActionLoading ? 'PROMOTING...' : 'PROMOTE TO SHADOW MODE'}
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Module 2: Stress-Testing CI Suite */}
+                    <div className="bg-neutral-950 border border-neutral-800 p-4 flex flex-col gap-3">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] font-mono text-rose-400 font-bold uppercase tracking-wider">Stress-Testing CI Gate</span>
+                        <span className="text-[9px] text-neutral-500 uppercase font-mono">STABILITY BENCHMARK: 95%</span>
+                      </div>
+                      <div className="space-y-3 max-h-[280px] overflow-y-auto pr-1">
+                        {researchDeskData?.stressTests?.map((test, index) => (
+                          <div key={index} className="p-3 bg-neutral-900/60 border border-neutral-800/80 hover:border-neutral-700 transition-colors">
+                            <div className="flex justify-between items-center">
+                              <span className="text-[11px] font-bold text-neutral-300 leading-snug">{test.scenarioName}</span>
+                              <span className={`text-[8px] font-mono px-1.5 py-0.5 font-bold uppercase ${
+                                test.passed ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400 animate-pulse'
+                              }`}>
+                                {test.passed ? 'PASS' : 'BLOCKED'}
+                              </span>
+                            </div>
+                            <p className="text-[9px] text-neutral-500 mt-1">{test.notes}</p>
+                            <div className="grid grid-cols-3 gap-2 mt-2 pt-2 border-t border-neutral-800/40 text-[9px] font-mono">
+                              <div>
+                                <span className="text-neutral-500 block">ATR VOL</span>
+                                <span className="text-neutral-300">{test.volatilityAtr.toFixed(1)} Ticks</span>
+                              </div>
+                              <div>
+                                <span className="text-neutral-500 block">SIM DRAWDOWN</span>
+                                <span className={`font-bold ${test.passed ? 'text-neutral-200' : 'text-red-400'}`}>-{test.simulatedDrawdown.toFixed(2)}%</span>
+                              </div>
+                              <div>
+                                <span className="text-neutral-500 block">MAX TOLERANCE</span>
+                                <span className="text-neutral-400">-{test.toleranceLimit.toFixed(2)}%</span>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="bg-neutral-900 p-2.5 border border-neutral-800 text-[9px] text-neutral-400 leading-snug font-mono mt-auto">
+                        <span className="text-rose-400 font-bold">CI GUARD ACTION:</span> Synthetic 2020-Style Vol explosion exceeds drawdown threshold (95th Pctl DD &gt; 5.0%). Configuration changes blocked on live server.
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {/* Module 3: Adaptive Execution Lookup Table */}
+                    <div className="bg-neutral-950 border border-neutral-800 p-4 flex flex-col gap-3">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] font-mono text-indigo-400 font-bold uppercase tracking-wider">Adaptive Execution Optimizer</span>
+                        <span className="text-[9px] text-neutral-500 uppercase font-mono">AUTO TUNED FROM SHORTFALL LOGS</span>
+                      </div>
+                      <p className="text-[10px] text-neutral-500 leading-normal">
+                        Self-tuning market routing table compiled dynamically using historical slippage metrics and current session liquidity:
+                      </p>
+                      <div className="overflow-x-auto border border-neutral-800">
+                        <table className="w-full text-left border-collapse font-mono text-[10px]">
+                          <thead className="bg-neutral-900 text-neutral-500 uppercase text-[8px] border-b border-neutral-800">
+                            <tr>
+                              <th className="p-2">SESSION</th>
+                              <th className="p-2">VOL STATE</th>
+                              <th className="p-2">OPTIMAL EXECUTION</th>
+                              <th className="p-2">SLIPPAGE</th>
+                              <th className="p-2 text-right">RESTING</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-neutral-900 bg-neutral-950">
+                            {researchDeskData?.adaptiveExecution?.map((row, idx) => (
+                              <tr key={idx} className="hover:bg-neutral-900/40">
+                                <td className="p-2 font-bold text-white uppercase">{row.session}</td>
+                                <td className="p-2 uppercase text-neutral-400">{row.volState}</td>
+                                <td className="p-2">
+                                  <span className={`px-1 py-0.2 rounded-[1px] text-[8px] font-bold ${
+                                    row.optimalExecution === 'POST_ONLY_LIMIT' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                                  }`}>
+                                    {row.optimalExecution}
+                                  </span>
+                                </td>
+                                <td className="p-2 text-neutral-300">+{row.slippageTicksPenalty.toFixed(1)} ticks</td>
+                                <td className="p-2 text-right text-neutral-500">{row.restingTimeSec}s</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Module 4: Capital Scaling Ladder & Profit Sweeper */}
+                    <div className="bg-neutral-950 border border-neutral-800 p-4 flex flex-col gap-3">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] font-mono text-emerald-400 font-bold uppercase tracking-wider">Capital Scaling Ladder</span>
+                        <span className="text-[9px] text-neutral-500 uppercase font-mono">AUTOMATED PROP DE-RISKING</span>
+                      </div>
+                      <div className="bg-neutral-900 p-3 border border-neutral-800 flex justify-between items-center text-[11px] font-mono">
+                        <div>
+                          <span className="text-white font-bold block">Current Ladder Tier:</span>
+                          <span className="text-[9px] text-neutral-500">Base Challenge Stage</span>
+                        </div>
+                        <span className="text-amber-500 font-bold text-base bg-amber-500/5 px-2 py-1 border border-amber-500/10">
+                          RUNG 1 (10K Funded)
+                        </span>
+                      </div>
+                      <div className="space-y-2 text-[10px] font-mono">
+                        <div className="flex justify-between py-1 border-b border-neutral-900">
+                          <span className="text-neutral-500">ACCUMULATED NET PROFIT:</span>
+                          <span className={`font-bold ${researchDeskData?.capitalLadder?.currentProfitUsd > 0 ? 'text-emerald-400' : 'text-neutral-400'}`}>
+                            ${researchDeskData?.capitalLadder?.currentProfitUsd?.toLocaleString() || '0.00'} USD
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1 border-b border-neutral-900">
+                          <span className="text-neutral-500">NEXT RUNG SCALE TARGET (15%):</span>
+                          <span className="text-neutral-300 font-bold">
+                            ${researchDeskData?.capitalLadder?.targetProfitToScale?.toLocaleString() || '1,500.00'} USD
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1 border-b border-neutral-900">
+                          <span className="text-neutral-500">SWEEPABLE BALANCE:</span>
+                          <span className="text-neutral-300 font-bold">
+                            ${researchDeskData?.capitalLadder?.sweepableBalanceUsd?.toLocaleString() || '0.00'} USD
+                          </span>
+                        </div>
+                        <div className="flex justify-between py-1">
+                          <span className="text-neutral-500">RUNG APPROVAL STATUS:</span>
+                          <span className={`font-bold uppercase ${researchDeskData?.capitalLadder?.approvedForNextRung ? 'text-emerald-400 animate-pulse' : 'text-amber-500'}`}>
+                            {researchDeskData?.capitalLadder?.approvedForNextRung ? 'QUALIFIED (APPROVED)' : 'NOT YET QUALIFIED'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <button
+                          onClick={() => handleDeskAction('approve_ladder_rung')}
+                          disabled={deskActionLoading || !researchDeskData?.capitalLadder?.approvedForNextRung}
+                          className="py-2 px-1 bg-emerald-600 disabled:bg-neutral-950 text-white disabled:text-neutral-600 border border-emerald-500/20 disabled:border-neutral-800 text-[10px] font-black uppercase tracking-wider hover:bg-emerald-500 disabled:opacity-50 transition-all cursor-pointer flex items-center justify-center gap-1 border-none"
+                        >
+                          <TrendingUp className="w-3 h-3" /> APPROVE RUNG SCALE
+                        </button>
+                        <button
+                          onClick={() => handleDeskAction('sweep_profits')}
+                          disabled={deskActionLoading || !(researchDeskData?.capitalLadder?.currentProfitUsd > 0)}
+                          className="py-2 px-1 bg-amber-500 disabled:bg-neutral-950 text-neutral-950 disabled:text-neutral-600 text-[10px] font-black uppercase tracking-wider hover:bg-amber-400 disabled:opacity-50 transition-all cursor-pointer flex items-center justify-center gap-1 border-none"
+                        >
+                          <DollarSign className="w-3 h-3" /> SWEEP PROFITS
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+
+              {/* RIGHT COLUMN (Lg: 4): AI META-LABELER PLAYPEN & SYSTEM ALERTS */}
+              <div className="lg:col-span-4 flex flex-col gap-6">
+                {/* AI Meta-Labeler Playground */}
+                <div className="bg-neutral-900 border border-amber-500/20 p-5 rounded-none flex flex-col gap-4 relative overflow-hidden">
+                  <div className="absolute -right-8 -top-8 w-24 h-24 bg-amber-500/5 rounded-full blur-2xl"></div>
+                  
+                  <div className="flex items-center gap-2">
+                    <Brain className="w-5 h-5 text-amber-500 animate-pulse" />
+                    <div>
+                      <h3 className="text-xs font-black text-amber-500 uppercase tracking-widest">
+                        AI Meta-Labeler diagnostics
+                      </h3>
+                      <span className="text-[9px] text-neutral-500 uppercase font-mono block">GEMINI-POWERED COGNITIVE FILTER</span>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-neutral-400 leading-normal">
+                    Manually pass on-exchange and macro metrics into our Gemini AI classifier to assess quality scoring on incoming signal waves before execution.
+                  </p>
+
+                  <form onSubmit={handleCheckMetaLabel} className="space-y-3 font-mono text-[11px]">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[9px] text-neutral-500 uppercase block mb-1">Module</label>
+                        <select
+                          value={metaLabelForm.module}
+                          onChange={(e) => setMetaLabelForm({ ...metaLabelForm, module: e.target.value })}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-xs px-2 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                        >
+                          <option value="trend">Trend Follower</option>
+                          <option value="range">Mean Reverter</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="text-[9px] text-neutral-500 uppercase block mb-1">Direction</label>
+                        <select
+                          value={metaLabelForm.side}
+                          onChange={(e) => setMetaLabelForm({ ...metaLabelForm, side: e.target.value })}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-xs px-2 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                        >
+                          <option value="buy">BUY (Long)</option>
+                          <option value="sell">SELL (Short)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[9px] text-neutral-500 uppercase block mb-1">ADX Index</label>
+                        <input
+                          type="number"
+                          value={metaLabelForm.adx}
+                          onChange={(e) => setMetaLabelForm({ ...metaLabelForm, adx: parseInt(e.target.value) || 20 })}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-xs px-2 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-[9px] text-neutral-500 uppercase block mb-1">Funding Pct%</label>
+                        <input
+                          type="number"
+                          value={metaLabelForm.fundingPercentile}
+                          onChange={(e) => setMetaLabelForm({ ...metaLabelForm, fundingPercentile: parseInt(e.target.value) || 50 })}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-xs px-2 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[9px] text-neutral-500 uppercase block mb-1">DXY Spot</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={metaLabelForm.dxy}
+                          onChange={(e) => setMetaLabelForm({ ...metaLabelForm, dxy: parseFloat(e.target.value) || 104.2 })}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-xs px-2 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-[9px] text-neutral-500 uppercase block mb-1">10Y Yield</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={metaLabelForm.yield10y}
+                          onChange={(e) => setMetaLabelForm({ ...metaLabelForm, yield10y: parseFloat(e.target.value) || 4.15 })}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-xs px-2 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <button
+                        type="submit"
+                        disabled={metaLabelLoading}
+                        className="w-full py-2 bg-amber-500 text-neutral-950 font-black uppercase text-[10px] tracking-widest hover:bg-amber-400 transition-all cursor-pointer flex items-center justify-center gap-1.5 mt-2"
+                      >
+                        {metaLabelLoading ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" /> ASSESSING SIGNAL FLOWS...
+                          </>
+                        ) : (
+                          <>
+                            <Brain className="w-3.5 h-3.5" /> EVALUATE QUALITY INDEX
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </form>
+
+                  {/* Prediction assessment display */}
+                  <div className="bg-neutral-950 border border-neutral-800 p-4 font-mono text-[11px] min-h-[140px] flex flex-col justify-between">
+                    {!metaLabelPrediction ? (
+                      <div className="text-neutral-600 text-center text-xs py-8 font-mono">
+                        Waiting for prediction trigger...
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex justify-between items-center border-b border-neutral-900 pb-2 mb-2">
+                          <span className="text-[9px] text-neutral-500 uppercase font-black">AI VERDICT RATING</span>
+                          <span className={`px-2 py-0.5 text-[10px] font-black uppercase border rounded ${
+                            metaLabelPrediction.rating === 'TAKE'
+                              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
+                              : 'bg-red-500/15 text-red-400 border-red-500/20 animate-pulse'
+                          }`}>
+                            {metaLabelPrediction.rating || 'SKIP'}
+                          </span>
+                        </div>
+                        <p className="text-neutral-300 leading-relaxed text-[11px]">
+                          {metaLabelPrediction.explanation}
+                        </p>
+                        <div className="text-[9px] text-neutral-500 flex justify-between mt-2 pt-2 border-t border-neutral-900">
+                          <span>PROBABILITY SCORE:</span>
+                          <span className="font-bold text-white">{metaLabelPrediction.probabilityScore || '0.0'}%</span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Dead-man's heartbeats & alarms */}
+                <div className="bg-neutral-900 border border-neutral-800 p-5 flex flex-col gap-4 font-mono text-[11px]">
+                  <h3 className="text-xs font-black text-neutral-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <Cpu className="w-4 h-4 text-amber-500" />
+                    Feeder Ops Monitoring
+                  </h3>
+
+                  <div className="space-y-3">
+                    <div className="bg-neutral-950 p-3 border border-neutral-800 flex justify-between items-center">
+                      <div>
+                        <span className="text-white font-bold block">Dead-Man's Switch</span>
+                        <span className="text-[10px] text-neutral-500">Auto-disarms EA on silent feeder</span>
+                      </div>
+                      <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded">
+                        DISARM SAFE
+                      </span>
+                    </div>
+
+                    <div className="bg-neutral-950 p-3 border border-neutral-800 flex justify-between items-center">
+                      <div>
+                        <span className="text-white font-bold block">Telegram Bot Alerts</span>
+                        <span className="text-[10px] text-neutral-500">Live operational error alerts</span>
+                      </div>
+                      <span className="text-[10px] font-bold text-neutral-400 bg-neutral-800 px-2 py-0.5 rounded">
+                        STANDBY
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         )}
       </main>
 

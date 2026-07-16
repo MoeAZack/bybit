@@ -234,6 +234,7 @@ export class BybitClient {
     triggerPrice?: string;
     triggerDirection?: number;
     triggerBy?: string;
+    timeInForce?: 'GTC' | 'IOC' | 'FOK' | 'PostOnly';
   }): Promise<any> {
     const orderParams: Record<string, any> = {
       category: 'linear',
@@ -241,7 +242,7 @@ export class BybitClient {
       side: params.side,
       orderType: params.orderType || 'Market',
       qty: params.qty,
-      timeInForce: 'GTC',
+      timeInForce: params.timeInForce || 'GTC',
       positionIdx: 0, // 0 for One-way mode, which is recommended
     };
 

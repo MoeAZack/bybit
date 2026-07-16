@@ -451,6 +451,7 @@ export class BasketManager {
           orderType: 'Limit',
           price: String(basket.p0),
           orderLinkId: `${basket.basketId}-r1`,
+          timeInForce: 'PostOnly',
         });
         basket.rungsOrderIds[0] = r1Result?.orderId || `${basket.basketId}-r1`;
 
@@ -465,6 +466,7 @@ export class BasketManager {
             orderType: 'Limit',
             price: String(rungPrice),
             orderLinkId,
+            timeInForce: 'PostOnly',
           });
           basket.rungsOrderIds[i] = res?.orderId || orderLinkId;
         }

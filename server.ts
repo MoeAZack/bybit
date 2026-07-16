@@ -11,6 +11,14 @@ import { RegimeRouter } from './server/router.js';
 import { BasketManager } from './server/basketManager.js';
 import { GoogleGenAI } from '@google/genai';
 import { registerMt5BridgeRoutes, enqueueMt5Command, getBridgeStatus } from './server/mt5bridge.js';
+import { QuantDataManager } from './server/quantData.js';
+import { StrategyRouter } from './server/strategyRouter.js';
+import { QuantRiskManager } from './server/quantRisk.js';
+import { ExecutionShortfall } from './server/executionShortfall.js';
+import { MetaLabeler } from './server/metaLabeler.js';
+import { MeasurementDesk } from './server/measurementDesk.js';
+import { OpsAlertsManager } from './server/opsAlerts.js';
+import { ResearchDeskManager } from './server/researchDesk.js';
 
 const app = express();
 const PORT = 3000;
@@ -587,6 +595,196 @@ app.post('/api/backtest', async (req, res) => {
     });
 
     res.json(result);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6c. Get Quant Macro & Positioning Metrics (DXY, 10Y Yield, Open Interest, Liquidations)
+app.get('/api/quant/metrics', async (req, res) => {
+  try {
+    const db = Database.get();
+    const symbol = db.settings.defaultSymbol || 'XAUUSDT';
+    
+    // Fetch macro charts
+    const macroCharts = await QuantDataManager.fetchMacroCharts();
+    const bybitData = await QuantDataManager.fetchBybitQuantData(symbol);
+    const dxy = await QuantDataManager.fetchDXYPrice();
+    const yield10y = await QuantDataManager.fetch10YTYield();
+
+    res.json({
+      success: true,
+      symbol,
+      dxy,
+      yield10y,
+      fundingRate: bybitData.fundingRate,
+      openInterest: bybitData.openInterest,
+      liquidationsUsd: bybitData.liquidationsUsd,
+      macroCharts,
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6d. Get Measurement Desk Performance & Analytics (Attribution, Drift, Monte Carlo, Shortfall, Alerts)
+app.get('/api/quant/performance', async (req, res) => {
+  try {
+    const db = Database.get();
+    const modules = StrategyRouter.getModulesStatus();
+    const riskCheck = await QuantRiskManager.checkRiskGating();
+    const decay = MeasurementDesk.checkEdgeDecay();
+    const attribution = MeasurementDesk.getAttributionStats();
+    const drift = MeasurementDesk.checkDriftStatus();
+    const monteCarlo = MeasurementDesk.runMonteCarlo();
+    const shortfallLogs = ExecutionShortfall.getLogs();
+    const alerts = OpsAlertsManager.getAlertLogs();
+    const deadman = OpsAlertsManager.checkDeadManSwitch();
+    const nakedAudit = OpsAlertsManager.auditNakedPositions();
+
+    res.json({
+      success: true,
+      modules,
+      riskGate: riskCheck,
+      edgeDecay: decay,
+      attribution,
+      drift,
+      monteCarlo,
+      shortfallLogs,
+      alerts,
+      deadman,
+      nakedAudit,
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6d2. Get Research Desk Metrics & Status
+app.get('/api/quant/research-desk', (req, res) => {
+  try {
+    const hypotheses = ResearchDeskManager.getHypotheses();
+    const stressTests = ResearchDeskManager.runStressTests();
+    const adaptiveExecution = ResearchDeskManager.getAdaptiveExecutionLookup();
+    const capitalLadder = ResearchDeskManager.getCapitalLadder();
+    
+    res.json({
+      success: true,
+      hypotheses,
+      stressTests,
+      adaptiveExecution,
+      capitalLadder,
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6d3. Handle Research Desk Actions (Hypothesis Promotion, Capital Scale Approval)
+app.post('/api/quant/research-desk/action', (req, res) => {
+  try {
+    const { actionType, targetId } = req.body;
+    const db = Database.get();
+
+    if (actionType === 'promote_hypothesis') {
+      const hypotheses = ResearchDeskManager.getHypotheses();
+      const hyp = hypotheses.find(h => h.id === targetId);
+      if (hyp) {
+        hyp.recommendation = 'SHADOW_MODE_PROMOTION';
+        // Add alert to log
+        Database.addLog({
+          rawBody: req.body,
+          status: 'success',
+          action: 'none',
+          symbol: 'XAUUSD',
+          price: 0,
+          quantity: 0,
+          message: `[Quant Research] Promoted hypothesis "${hyp.title}" to active Shadow Mode. Sizing and tracking initialized.`,
+          mode: 'paper'
+        });
+        return res.json({ success: true, message: `Successfully promoted "${hyp.title}" to Shadow Mode.` });
+      }
+      return res.status(404).json({ error: 'Hypothesis not found.' });
+    }
+
+    if (actionType === 'approve_ladder_rung') {
+      const ladder = ResearchDeskManager.getCapitalLadder();
+      // Increase leverage size factor or upgrade default order size
+      const currentSize = db.settings.defaultOrderSize || 0.1;
+      db.settings.defaultOrderSize = Number((currentSize + 0.1).toFixed(2));
+      Database.save(db);
+
+      Database.addLog({
+        rawBody: req.body,
+        status: 'success',
+        action: 'none',
+        symbol: 'XAUUSD',
+        price: 0,
+        quantity: 0,
+        message: `[Capital Automation] Rung upgrade approved! Default order size scaled up from ${currentSize} to ${db.settings.defaultOrderSize} Lots.`,
+        mode: 'paper'
+      });
+
+      return res.json({ success: true, message: `Approved capital rung upgrade! Order size is now scaled to ${db.settings.defaultOrderSize} Lots.` });
+    }
+
+    if (actionType === 'sweep_profits') {
+      const balance = db.paperAccount?.balance || 10000;
+      const initialBalance = 10000;
+      const profit = balance - initialBalance;
+      
+      if (profit <= 0) {
+        return res.status(400).json({ error: 'No accumulated profits available for sweep.' });
+      }
+
+      // Sweep profit out of paper trade balance to simulate cold spot vault or Earn sweep
+      db.paperAccount.balance = initialBalance; // resets balance back to base, sweeping profit
+      Database.save(db);
+      
+      Database.addLog({
+        rawBody: req.body,
+        status: 'success',
+        action: 'none',
+        symbol: 'USD',
+        price: 0,
+        quantity: 0,
+        message: `[Capital Automation] Profit Sweep completed! Transferred $${profit.toFixed(2)} USD from trading collateral to off-exchange Earn/Spot Wallet.`,
+        mode: 'paper'
+      });
+
+      return res.json({ success: true, message: `Successfully swept $${profit.toFixed(2)} USD to Spot/Earn Wallet.` });
+    }
+
+    return res.status(400).json({ error: 'Invalid actionType specified.' });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6e. Evaluate AI Meta-Labeler Setup (Take vs Skip)
+app.post('/api/quant/meta-label', async (req, res) => {
+  try {
+    const { module, side, adx, fundingPercentile, bandwidthPercentile, dxy, yield10y, session } = req.body;
+    
+    if (!module || !side) {
+      return res.status(400).json({ error: 'module and side are required in the payload.' });
+    }
+
+    const prediction = await MetaLabeler.classifySignal({
+      module,
+      side: side.toUpperCase() as 'BUY' | 'SELL',
+      adx: Number(adx || 22),
+      fundingPercentile: Number(fundingPercentile || 50),
+      bandwidthPercentile: Number(bandwidthPercentile || 50),
+      dxy: Number(dxy || 104.5),
+      yield10y: Number(yield10y || 4.2),
+      session: session || 'london',
+    });
+
+    res.json({
+      success: true,
+      prediction,
+    });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }

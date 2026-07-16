@@ -207,7 +207,7 @@ function bridgeAuth(req: Request, res: Response, next: NextFunction) {
   if (!expected) {
     return res.status(503).send('MT5_BRIDGE_TOKEN not configured on server');
   }
-  const got = String(req.headers['x-bridge-token'] || '');
+  const got = String(req.headers['x-bridge-token'] || req.query.token || '');
   // constant-time compare
   const a = Buffer.from(got);
   const b = Buffer.from(expected);
@@ -223,6 +223,76 @@ function bridgeAuth(req: Request, res: Response, next: NextFunction) {
 
 export function registerMt5BridgeRoutes(app: Express) {
   const text = express.text({ type: '*/*', limit: '64kb' });
+
+  /** Dynamically generate and serve startup.ini for headless MT5 terminal automation */
+  app.get('/bridge/download/ini', bridgeAuth, (req, res) => {
+    const symbol = String(req.query.symbol || 'XAUUSD');
+    const period = String(req.query.period || 'M15');
+    const login = String(req.query.login || 'YOUR_MT5_LOGIN');
+    const password = String(req.query.password || 'YOUR_MT5_PASSWORD');
+    const serverName = String(req.query.server || 'YOUR_BROKER_SERVER');
+
+    const iniContent = [
+      '[Common]',
+      `Login=${login}`,
+      `Password=${password}`,
+      `Server=${serverName}`,
+      'AutoConfiguration=true',
+      'ProxyEnable=false',
+      'KeepPassword=true',
+      '',
+      '[Charts]',
+      'Profile=default',
+      'MaxBars=100000',
+      '',
+      '[Experts]',
+      'AllowLiveTrading=true',
+      'AllowDllImport=true',
+      'Enabled=true',
+      '',
+      '[Startup]',
+      `Symbol=${symbol}`,
+      `Period=${period}`,
+      'Template=',
+      'Expert=MoebyBridge',
+      'ExpertParameters=MoebyBridge.set',
+      ''
+    ].join('\r\n');
+
+    res.setHeader('Content-Disposition', 'attachment; filename="startup.ini"');
+    res.type('text/plain').send(iniContent);
+  });
+
+  /** Dynamically generate and serve MoebyBridge.set inputs */
+  app.get('/bridge/download/set', bridgeAuth, (req, res) => {
+    const protocol = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const host = req.get('host');
+    const serverUrl = `${protocol}://${host}`;
+    const token = process.env.MT5_BRIDGE_TOKEN || 'CHANGE_ME';
+    const pollMs = String(req.query.pollMs || '1000');
+    const hbSec = String(req.query.hbSec || '20');
+    const magic = String(req.query.magic || '880088');
+    const maxVol = String(req.query.maxVol || '0.10');
+    const allowedSymbols = String(req.query.allowedSymbols || 'XAUUSD,XAUUSDT');
+    const slippage = String(req.query.slippage || '30');
+    const armedOnStart = String(req.query.armed || 'true');
+
+    const setContent = [
+      `InpServerURL=${serverUrl}`,
+      `InpBridgeToken=${token}`,
+      `InpPollMs=${pollMs}`,
+      `InpHeartbeatSec=${hbSec}`,
+      `InpMagic=${magic}`,
+      `InpMaxVolume=${maxVol}`,
+      `InpSymbolAllow=${allowedSymbols}`,
+      `InpSlippagePts=${slippage}`,
+      `InpArmedOnStart=${armedOnStart}`,
+      ''
+    ].join('\r\n');
+
+    res.setHeader('Content-Disposition', 'attachment; filename="MoebyBridge.set"');
+    res.type('text/plain').send(setContent);
+  });
 
   /** EA polls for work. Serves pending commands and marks them claimed. */
   app.get('/bridge/commands', bridgeAuth, (_req, res) => {
