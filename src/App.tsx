@@ -190,7 +190,7 @@ export default function App() {
     bybitApiSecret: '',
     isTestnet: true,
     isPaperTrading: true,
-    webhookPassphrase: 'GOLD_ALGO_88',
+    webhookPassphrase: 'XAU_SECURE_99X_WG',
     defaultSymbol: 'XAUUSDT',
     defaultLeverage: 10,
     defaultOrderSize: 0.1,
@@ -933,7 +933,7 @@ export default function App() {
   // Extract variables for setup tab representation
   const webhookUrl = `${window.location.origin}/api/tradingview-webhook`;
   const samplePayload = {
-    passphrase: settings.webhookPassphrase || 'GOLD_ALGO_88',
+    passphrase: settings.webhookPassphrase || 'XAU_SECURE_99X_WG',
     action: 'buy',
     symbol: settings.defaultSymbol || 'XAUUSDT',
     volume: settings.defaultOrderSize || 0.1,

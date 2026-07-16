@@ -3,45 +3,82 @@
  * plus a recurring generator for first Friday (NFP), second Wednesday (CPI), and third Wednesday (FOMC).
  */
 
-const MAJOR_EVENTS_2026 = [
-  // CPI Dates (usually 13:30 UTC)
-  new Date('2026-01-13T13:30:00Z'),
-  new Date('2026-02-13T13:30:00Z'),
-  new Date('2026-03-12T13:30:00Z'),
-  new Date('2026-04-10T13:30:00Z'),
-  new Date('2026-05-13T13:30:00Z'),
-  new Date('2026-06-12T13:30:00Z'),
-  new Date('2026-07-14T13:30:00Z'),
-  new Date('2026-08-13T13:30:00Z'),
-  new Date('2026-09-11T13:30:00Z'),
-  new Date('2026-10-14T13:30:00Z'),
-  new Date('2026-11-13T13:30:00Z'),
-  new Date('2026-12-11T13:30:00Z'),
+/**
+ * A helper function to check if a Date falls within US Daylight Saving Time (DST).
+ * US DST begins on the second Sunday of March and ends on the first Sunday of November.
+ */
+function isUSDaylightSavingTime(date: Date): boolean {
+  const year = date.getUTCFullYear();
+  
+  // Start of DST: Second Sunday in March
+  const march1 = new Date(Date.UTC(year, 2, 1)); // 2 = March
+  const dayOfWeekMarch1 = march1.getUTCDay();
+  const firstSundayMarch = 1 + (dayOfWeekMarch1 === 0 ? 0 : 7 - dayOfWeekMarch1);
+  const secondSundayMarch = firstSundayMarch + 7;
+  const dstStart = new Date(Date.UTC(year, 2, secondSundayMarch, 7, 0, 0)); // 2:00 AM EST = 7:00 AM UTC
+  
+  // End of DST: First Sunday in November
+  const nov1 = new Date(Date.UTC(year, 10, 1)); // 10 = November
+  const dayOfWeekNov1 = nov1.getUTCDay();
+  const firstSundayNov = 1 + (dayOfWeekNov1 === 0 ? 0 : 7 - dayOfWeekNov1);
+  const dstEnd = new Date(Date.UTC(year, 10, firstSundayNov, 6, 0, 0)); // 2:00 AM EDT = 6:00 AM UTC
 
-  // FOMC (Wednesday 19:00 UTC)
-  new Date('2026-01-28T19:00:00Z'),
-  new Date('2026-03-18T19:00:00Z'),
-  new Date('2026-04-29T19:00:00Z'),
-  new Date('2026-06-17T19:00:00Z'),
-  new Date('2026-07-29T19:00:00Z'),
-  new Date('2026-09-23T19:00:00Z'),
-  new Date('2026-11-04T19:00:00Z'),
-  new Date('2026-12-16T19:00:00Z'),
+  const t = date.getTime();
+  return t >= dstStart.getTime() && t < dstEnd.getTime();
+}
 
-  // NFP (First Friday 13:30 UTC)
-  new Date('2026-01-02T13:30:00Z'),
-  new Date('2026-02-06T13:30:00Z'),
-  new Date('2026-03-06T13:30:00Z'),
-  new Date('2026-04-03T13:30:00Z'),
-  new Date('2026-05-08T13:30:00Z'),
-  new Date('2026-06-05T13:30:00Z'),
-  new Date('2026-07-03T13:30:00Z'),
-  new Date('2026-08-07T13:30:00Z'),
-  new Date('2026-09-04T13:30:00Z'),
-  new Date('2026-10-02T13:30:00Z'),
-  new Date('2026-11-06T13:30:00Z'),
-  new Date('2026-12-04T13:30:00Z'),
+/**
+ * Creates a UTC Date representing a specific time in Eastern Time (ET).
+ * Handles EST (UTC-5) and EDT (UTC-4) based on DST rules.
+ */
+export function createETDate(year: number, month: number, day: number, hourET: number, minuteET: number): Date {
+  const tempDate = new Date(Date.UTC(year, month, day, hourET, minuteET));
+  const isDst = isUSDaylightSavingTime(tempDate);
+  const offsetHours = isDst ? 4 : 5;
+  return new Date(Date.UTC(year, month, day, hourET + offsetHours, minuteET, 0));
+}
+
+const MAJOR_EVENTS_ET = [
+  // CPI Dates (usually 8:30 AM ET)
+  { y: 2026, m: 0, d: 13, h: 8, min: 30 },
+  { y: 2026, m: 1, d: 13, h: 8, min: 30 },
+  { y: 2026, m: 2, d: 12, h: 8, min: 30 },
+  { y: 2026, m: 3, d: 10, h: 8, min: 30 },
+  { y: 2026, m: 4, d: 13, h: 8, min: 30 },
+  { y: 2026, m: 5, d: 12, h: 8, min: 30 },
+  { y: 2026, m: 6, d: 14, h: 8, min: 30 },
+  { y: 2026, m: 7, d: 13, h: 8, min: 30 },
+  { y: 2026, m: 8, d: 11, h: 8, min: 30 },
+  { y: 2026, m: 9, d: 14, h: 8, min: 30 },
+  { y: 2026, m: 10, d: 13, h: 8, min: 30 },
+  { y: 2026, m: 11, d: 11, h: 8, min: 30 },
+
+  // FOMC (Wednesday 2:00 PM / 14:00 ET)
+  { y: 2026, m: 0, d: 28, h: 14, min: 0 },
+  { y: 2026, m: 2, d: 18, h: 14, min: 0 },
+  { y: 2026, m: 3, d: 29, h: 14, min: 0 },
+  { y: 2026, m: 5, d: 17, h: 14, min: 0 },
+  { y: 2026, m: 6, d: 29, h: 14, min: 0 },
+  { y: 2026, m: 8, d: 23, h: 14, min: 0 },
+  { y: 2026, m: 10, d: 4, h: 14, min: 0 },
+  { y: 2026, m: 11, d: 16, h: 14, min: 0 },
+
+  // NFP (First Friday 8:30 AM ET)
+  { y: 2026, m: 0, d: 2, h: 8, min: 30 },
+  { y: 2026, m: 1, d: 6, h: 8, min: 30 },
+  { y: 2026, m: 2, d: 6, h: 8, min: 30 },
+  { y: 2026, m: 3, d: 3, h: 8, min: 30 },
+  { y: 2026, m: 4, d: 8, h: 8, min: 30 },
+  { y: 2026, m: 5, d: 5, h: 8, min: 30 },
+  { y: 2026, m: 6, d: 3, h: 8, min: 30 },
+  { y: 2026, m: 7, d: 7, h: 8, min: 30 },
+  { y: 2026, m: 8, d: 4, h: 8, min: 30 },
+  { y: 2026, m: 9, d: 2, h: 8, min: 30 },
+  { y: 2026, m: 10, d: 6, h: 8, min: 30 },
+  { y: 2026, m: 11, d: 4, h: 8, min: 30 },
 ];
+
+const MAJOR_EVENTS_2026 = MAJOR_EVENTS_ET.map(e => createETDate(e.y, e.m, e.d, e.h, e.min));
 
 /**
  * Returns dynamic recurring tier-1 event times for a given year and month to cover dates not listed explicitly.
@@ -49,15 +86,15 @@ const MAJOR_EVENTS_2026 = [
 function getRecurringEventsForMonth(year: number, month: number): Date[] {
   const events: Date[] = [];
   
-  // 1. NFP (First Friday of month at 13:30 UTC)
-  const nfpDate = new Date(Date.UTC(year, month, 1, 13, 30, 0));
+  // 1. NFP (First Friday of month at 8:30 AM ET)
+  const nfpDate = new Date(Date.UTC(year, month, 1, 12, 0, 0));
   while (nfpDate.getUTCDay() !== 5) {
     nfpDate.setUTCDate(nfpDate.getUTCDate() + 1);
   }
-  events.push(nfpDate);
+  events.push(createETDate(year, month, nfpDate.getUTCDate(), 8, 30));
 
-  // 2. CPI (Second Wednesday of month at 13:30 UTC)
-  const cpiDate = new Date(Date.UTC(year, month, 1, 13, 30, 0));
+  // 2. CPI (Second Wednesday of month at 8:30 AM ET)
+  const cpiDate = new Date(Date.UTC(year, month, 1, 12, 0, 0));
   let wedCount = 0;
   while (wedCount < 2) {
     if (cpiDate.getUTCDay() === 3) {
@@ -66,10 +103,10 @@ function getRecurringEventsForMonth(year: number, month: number): Date[] {
     }
     cpiDate.setUTCDate(cpiDate.getUTCDate() + 1);
   }
-  events.push(cpiDate);
+  events.push(createETDate(year, month, cpiDate.getUTCDate(), 8, 30));
 
-  // 3. FOMC (Third Wednesday of month at 19:00 UTC)
-  const fomcDate = new Date(Date.UTC(year, month, 1, 19, 0, 0));
+  // 3. FOMC (Third Wednesday of month at 2:00 PM / 14:00 ET)
+  const fomcDate = new Date(Date.UTC(year, month, 1, 12, 0, 0));
   let fomcWedCount = 0;
   while (fomcWedCount < 3) {
     if (fomcDate.getUTCDay() === 3) {
@@ -78,7 +115,7 @@ function getRecurringEventsForMonth(year: number, month: number): Date[] {
     }
     fomcDate.setUTCDate(fomcDate.getUTCDate() + 1);
   }
-  events.push(fomcDate);
+  events.push(createETDate(year, month, fomcDate.getUTCDate(), 14, 0));
 
   return events;
 }
@@ -106,7 +143,7 @@ export function getAllEvents(aroundTime: Date): Date[] {
 
 /**
  * Check if the given time falls within the event blackout window:
- * [-15 minutes, +60 minutes] of any Tier-1 event.
+ * [-45 minutes, +90 minutes] of any Tier-1 event (widened ±30 min as insurance).
  */
 export function isWithinTier1Blackout(time: Date): { active: boolean; eventTime?: Date; reason?: string } {
   const events = getAllEvents(time);
@@ -114,14 +151,14 @@ export function isWithinTier1Blackout(time: Date): { active: boolean; eventTime?
 
   for (const event of events) {
     const et = event.getTime();
-    const startBlackout = et - 15 * 60 * 1000; // 15 mins before
-    const endBlackout = et + 60 * 60 * 1000;   // 60 mins after
+    const startBlackout = et - 45 * 60 * 1000; // 45 mins before (widened from 15m)
+    const endBlackout = et + 90 * 60 * 1000;   // 90 mins after (widened from 60m)
 
     if (t >= startBlackout && t <= endBlackout) {
       return {
         active: true,
         eventTime: event,
-        reason: `VETO (Blackout Gate): Tier-1 Event blackout active around ${event.toUTCString()} (Window: -15m to +60m). Current time: ${time.toUTCString()}`,
+        reason: `VETO (Blackout Gate): Tier-1 Event blackout active around ${event.toUTCString()} (Window: -45m to +90m). Current time: ${time.toUTCString()}`,
       };
     }
   }

@@ -732,7 +732,19 @@ app.post('/api/tradingview-webhook', async (req, res) => {
     }
 
     if (adxValue === undefined || isNaN(adxValue)) {
-      adxValue = 21.5 + Math.random() * 5;
+      const errMsg = `VETO (Regime Router Gate): Failed to compute real-time ADX value for ${symbol}. Trade signal rejected for safety (fail-closed).`;
+      console.warn(`[RegimeRouter] ${errMsg}`);
+      const log = Database.addLog({
+        rawBody: payload,
+        status: 'execution_failed',
+        action,
+        symbol,
+        price: 0,
+        quantity,
+        message: errMsg,
+        mode: settings.isPaperTrading ? 'paper' : 'live',
+      });
+      return res.status(400).json({ error: errMsg, logId: log.id });
     }
 
     const regimeResult = RegimeRouter.getActiveRegime({
@@ -1115,7 +1127,7 @@ app.post('/api/generate-pinescript', async (req, res) => {
   if (!ai) {
     // Elegant static fallback if Gemini API Key isn't loaded
     const db = Database.get();
-    const passphrase = db.settings.webhookPassphrase || 'GOLD_ALGO_88';
+    const passphrase = db.settings.webhookPassphrase || 'XAU_SECURE_99X_WG';
     const staticPineScript = `//@version=5
 strategy("Bybit Gold Webhook Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
 
@@ -1152,7 +1164,7 @@ if (sellSignal)
 
   try {
     const db = Database.get();
-    const passphrase = db.settings.webhookPassphrase || 'GOLD_ALGO_88';
+    const passphrase = db.settings.webhookPassphrase || 'XAU_SECURE_99X_WG';
     const symbol = db.settings.defaultSymbol || 'XAUUSDT';
     const qty = db.settings.defaultOrderSize || 0.1;
 

@@ -1,6 +1,7 @@
 import { ClosedTrade, getContractMultiplier } from './db.js';
 import { BybitClient } from './bybit.js';
 import { calculateBollingerBands, calculateSessionVWAP } from './indicators.js';
+import { isWithinTier1Blackout } from './newsCalendar.js';
 
 function calculateEMA(prices: number[], period: number): number[] {
   const ema: number[] = [];
@@ -451,15 +452,8 @@ export class Backtester {
         lastDateStr = currentDateString;
       }
 
-      // Check event blackout: Mondays, Wednesdays, Fridays 13:15 to 14:15 or Wednesdays 18:45 to 19:45
-      const dayOfWeek = curr.time.getUTCDay();
-      const hour = curr.time.getUTCHours();
-      const min = curr.time.getUTCMinutes();
-      
-      const isNewsBlackoutActive = params.isEventBlackoutActive && (
-        ((dayOfWeek === 1 || dayOfWeek === 3 || dayOfWeek === 5) && hour === 13 && min >= 15 && min <= 45) ||
-        (dayOfWeek === 3 && hour === 19 && min >= 0 && min <= 30)
-      );
+      // Check event blackout using the robust DST-aware calendar and widened ±30 min window
+      const isNewsBlackoutActive = params.isEventBlackoutActive && isWithinTier1Blackout(curr.time).active;
 
       // 1. Blackout News Flattening Upgrade
       if (isNewsBlackoutActive && currentPosition) {
@@ -958,14 +952,8 @@ export class Backtester {
         lastDateStr = currentDateString;
       }
 
-      // Check news blackout
-      const dayOfWeek = curr.time.getUTCDay();
-      const hour = curr.time.getUTCHours();
-      const min = curr.time.getUTCMinutes();
-      const isNewsBlackoutActive = params.isEventBlackoutActive && (
-        ((dayOfWeek === 1 || dayOfWeek === 3 || dayOfWeek === 5) && hour === 13 && min >= 15 && min <= 45) ||
-        (dayOfWeek === 3 && hour === 19 && min >= 0 && min <= 30)
-      );
+      // Check news blackout using the robust DST-aware calendar and widened ±30 min window
+      const isNewsBlackoutActive = params.isEventBlackoutActive && isWithinTier1Blackout(curr.time).active;
 
       if (activeBasket) {
         let closed = false;

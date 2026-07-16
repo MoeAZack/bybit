@@ -162,7 +162,7 @@ const defaultDb: DbSchema = {
     isTestnet: true,
     bybitEnvironment: 'demo',
     isPaperTrading: true,
-    webhookPassphrase: 'GOLD_ALGO_88',
+    webhookPassphrase: 'XAU_SECURE_99X_WG',
     defaultSymbol: 'XAUUSDT',
     defaultLeverage: 10,
     defaultOrderSize: 0.1,
@@ -223,7 +223,7 @@ const defaultDb: DbSchema = {
       id: 'log-1',
       timestamp: new Date(Date.now() - 4 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'GOLD_ALGO_88',
+        passphrase: 'XAU_SECURE_99X_WG',
         action: 'buy',
         symbol: 'XAUUSDT',
         price: 2362.45,
@@ -242,7 +242,7 @@ const defaultDb: DbSchema = {
       id: 'log-2',
       timestamp: new Date(Date.now() - 3.5 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'GOLD_ALGO_88',
+        passphrase: 'XAU_SECURE_99X_WG',
         action: 'sell',
         symbol: 'XAUUSDT',
         price: 2368.10,
@@ -279,7 +279,7 @@ const defaultDb: DbSchema = {
       id: 'log-4',
       timestamp: new Date(Date.now() - 1 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'GOLD_ALGO_88',
+        passphrase: 'XAU_SECURE_99X_WG',
         action: 'close',
         symbol: 'XAUUSDT',
         price: 2371.30,
