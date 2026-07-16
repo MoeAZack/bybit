@@ -271,6 +271,8 @@ export default function App() {
     2370.10, 2371.40, 2368.50, 2372.20, 2374.80, 2373.15, 2375.40, 2374.90,
     2376.10, 2374.30, 2373.80, 2375.20, 2377.10, 2376.50, 2375.45
   ]);
+  const [priceChange, setPriceChange] = useState<'up' | 'down' | null>(null);
+  const [flashKey, setFlashKey] = useState<number>(0);
 
   // UI state
   const [activeTab, setActiveTab] = useState<'monitor' | 'setup' | 'settings' | 'trades' | 'sandbox' | 'quant'>('monitor');
@@ -627,6 +629,14 @@ export default function App() {
         const change = (Math.random() - 0.5) * 0.8;
         const newPrice = Number((prev + change).toFixed(2));
         
+        if (newPrice > prev) {
+          setPriceChange('up');
+          setFlashKey(k => k + 1);
+        } else if (newPrice < prev) {
+          setPriceChange('down');
+          setFlashKey(k => k + 1);
+        }
+
         setPriceHistory(history => {
           const nextHistory = [...history, newPrice];
           if (nextHistory.length > 25) {
@@ -1523,7 +1533,19 @@ export default function App() {
                     <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[9px] px-1.5 py-0.5 font-bold uppercase tracking-wider rounded">REAL-TIME WALK</span>
                   </div>
                   <h1 className="text-6xl md:text-7xl font-black tracking-tighter leading-none mt-2 font-mono">
-                    <span className="text-neutral-600">$</span>{goldPrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                    <span className="text-neutral-600">$</span>
+                    <span
+                      key={flashKey}
+                      className={
+                        priceChange === 'up'
+                          ? 'animate-flash-green inline-block'
+                          : priceChange === 'down'
+                          ? 'animate-flash-red inline-block'
+                          : 'inline-block'
+                      }
+                    >
+                      {goldPrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                    </span>
                   </h1>
                 </div>
 

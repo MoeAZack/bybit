@@ -66,10 +66,10 @@ void OnDeinit(const int reason)
 void OnTimer()
 {
    PollCommands();
-   if(TimeCurrent() - g_lastHb >= InpHeartbeatSec)
+   if(TimeLocal() - g_lastHb >= InpHeartbeatSec)
    {
       SendHeartbeat();
-      g_lastHb = TimeCurrent();
+      g_lastHb = TimeLocal();
    }
 }
 
@@ -112,7 +112,13 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 //+------------------------------------------------------------------+
 bool HttpCall(const string method, const string path, const string payload, string &response)
 {
-   string url     = InpServerURL + path;
+   string baseUrl = InpServerURL;
+   int lenBase = StringLen(baseUrl);
+   if(lenBase > 0 && StringSubstr(baseUrl, lenBase - 1, 1) == "/")
+   {
+      baseUrl = StringSubstr(baseUrl, 0, lenBase - 1);
+   }
+   string url     = baseUrl + path;
    string headers = "X-Bridge-Token: " + InpBridgeToken + "\r\nContent-Type: text/plain\r\n";
    char   data[];
    char   result[];
@@ -314,7 +320,10 @@ void SendHeartbeat()
    }
 
    string resp;
-   HttpCall("POST", "/bridge/heartbeat", hb, resp);
+   if(HttpCall("POST", "/bridge/heartbeat", hb, resp))
+   {
+      Print("[MoebyBridge] Heartbeat success: ", resp);
+   }
 }
 
 //+------------------------------------------------------------------+
