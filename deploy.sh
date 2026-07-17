@@ -7,6 +7,19 @@
 # Usage:  PROJECT_ID=your-project ./deploy.sh
 set -euo pipefail
 
+# Git Bash/MSYS rewrites arguments that look like absolute unix paths, turning
+# mount-path=/app/data into C:/Program Files/Git/app/data. Measured behaviour:
+#   /app/data  -> C:/Program Files/Git/app/data   (mangled)
+#   //app/data -> //app/data                      (literal, still rejected)
+# Setting MSYS_NO_PATHCONV globally breaks gcloud's own bash launcher, which needs the
+# conversion to locate its Python entrypoint. So for the one call carrying a mount path,
+# invoke gcloud.cmd (a batch file, run by cmd.exe) with conversion off just for it.
+RUN_DEPLOY="gcloud"
+DEPLOY_ENV=""
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW*|MSYS*|CYGWIN*) RUN_DEPLOY="gcloud.cmd"; DEPLOY_ENV="MSYS_NO_PATHCONV=1" ;;
+esac
+
 PROJECT_ID="${PROJECT_ID:?set PROJECT_ID}"
 REGION="${REGION:-europe-west1}"
 SERVICE="${SERVICE:-moeby}"
@@ -72,6 +85,19 @@ for s in API_AUTH_TOKEN MT5_BRIDGE_TOKEN GEMINI_API_KEY; do
   bind_secret "$s"
 done
 
+# --- Persistent storage for db.json ------------------------------------------
+# server/db.ts writes data/db.json with writeFileSync. On Cloud Run that path is
+# per-instance and ephemeral, so settings reset on every cold start and every deploy.
+# Mounting a bucket there makes the same code durable with no changes.
+BUCKET="${BUCKET:-${PROJECT_ID}-moeby-data}"
+if ! gcloud storage buckets describe "gs://${BUCKET}" >/dev/null 2>&1; then
+  gcloud storage buckets create "gs://${BUCKET}" \
+    --location="$REGION" --uniform-bucket-level-access
+  echo "created gs://${BUCKET}"
+fi
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA}" --role=roles/storage.objectAdmin >/dev/null
+
 # --- Cloud Build permissions -------------------------------------------------
 # `run deploy --source` builds via Cloud Build as the default compute SA. New projects no
 # longer get the automatic role grants, so that SA cannot read the source bucket it was
@@ -92,7 +118,7 @@ gcloud iam service-accounts add-iam-policy-binding "$SA" \
 # --- Deploy ------------------------------------------------------------------
 # --max-instances=1 is load-bearing, not tuning: db.json is per-instance file state, so a
 # second instance means two divergent copies of your positions.
-gcloud run deploy "$SERVICE" \
+env $DEPLOY_ENV "$RUN_DEPLOY" run deploy "$SERVICE" \
   --source . \
   --region "$REGION" \
   --service-account "$SA" \
@@ -102,6 +128,9 @@ gcloud run deploy "$SERVICE" \
   --cpu=1 --memory=1Gi \
   --no-cpu-throttling \
   --timeout=300 \
+  --execution-environment=gen2 \
+  --add-volume=name=moeby-data,type=cloud-storage,bucket="$BUCKET" \
+  --add-volume-mount=volume=moeby-data,mount-path=/app/data \
   --set-env-vars=NODE_ENV=production,DISABLE_API_AUTH="${DISABLE_API_AUTH:-false}" \
   --set-secrets=API_AUTH_TOKEN=API_AUTH_TOKEN:latest,MT5_BRIDGE_TOKEN=MT5_BRIDGE_TOKEN:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest
 
