@@ -67,6 +67,8 @@ export interface BridgeStatus {
   freeMargin: number | null;
   positions: BridgePosition[];
   queueDepth: number;
+  price: number | null;        // live gold bid from the terminal, 0/null if unavailable
+  priceSymbol: string | null;  // the MT5 symbol that price came from (e.g. XAUUSD)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +82,7 @@ const COMMAND_TTL_MS = 5 * 60_000; // stale pending commands expire (never trade
 const RESULT_KEEP = 200;
 
 let queue: BridgeCommand[] = [];
-let heartbeat: { at: number; equity: number; balance: number; freeMargin: number; armed: boolean; positions: BridgePosition[] } | null = null;
+let heartbeat: { at: number; equity: number; balance: number; freeMargin: number; armed: boolean; positions: BridgePosition[]; price: number; priceSymbol: string } | null = null;
 
 function persist() {
   const db = Database.get() as any;
@@ -151,6 +153,8 @@ export function getBridgeStatus(): BridgeStatus {
     freeMargin: heartbeat?.freeMargin ?? null,
     positions: heartbeat?.positions ?? [],
     queueDepth: queue.filter(c => c.status === 'pending' || c.status === 'claimed').length,
+    price: fresh && heartbeat!.price > 0 ? heartbeat!.price : null,
+    priceSymbol: fresh && heartbeat!.priceSymbol ? heartbeat!.priceSymbol : null,
   };
 }
 
@@ -370,6 +374,9 @@ export function registerMt5BridgeRoutes(app: Express) {
         freeMargin: parseFloat(hbLine[3]) || 0,
         armed: hbLine[5] === 'armed',
         positions,
+        // Fields 6/7 added later; older EAs omit them, so default safely.
+        price: parseFloat(hbLine[6]) || 0,
+        priceSymbol: (hbLine[7] || '').trim(),
       };
     }
     res.type('text/plain').send('ACK');

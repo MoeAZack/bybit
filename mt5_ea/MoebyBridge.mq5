@@ -298,11 +298,16 @@ string FlattenAll(const string id)
 //+------------------------------------------------------------------+
 void SendHeartbeat()
 {
+   string priceSym = "";
+   double goldBid  = GoldBid(priceSym);
+
    string hb = "HB|" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)
              + "|" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2)
              + "|" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2)
              + "|" + (string)PositionsTotal()
-             + "|" + (g_armed ? "armed" : "disarmed") + "\n";
+             + "|" + (g_armed ? "armed" : "disarmed")
+             + "|" + DoubleToString(goldBid, 2)
+             + "|" + priceSym + "\n";
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -387,5 +392,26 @@ bool SymbolAllowed(const string symbol)
       if(StringCompare(s, symbol, false) == 0) return(true);
    }
    return(false);
+}
+
+//+------------------------------------------------------------------+
+//| The gold symbol whose price feeds the dashboard: first entry in   |
+//| the allow-list. Ensures it is in Market Watch before reading.     |
+//+------------------------------------------------------------------+
+string GoldSymbol()
+{
+   string allow[];
+   int n = StringSplit(InpSymbolAllow, ',', allow);
+   if(n <= 0) return(_Symbol);
+   string s = allow[0];
+   StringTrimLeft(s); StringTrimRight(s);
+   return(s == "" ? _Symbol : s);
+}
+
+double GoldBid(string &outSymbol)
+{
+   outSymbol = GoldSymbol();
+   if(!SymbolSelect(outSymbol, true)) return(0.0);
+   return(SymbolInfoDouble(outSymbol, SYMBOL_BID));
 }
 //+------------------------------------------------------------------+
