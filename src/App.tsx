@@ -267,14 +267,14 @@ export default function App() {
     activeMode: 'paper',
   });
 
-  // Ticker and Chart state
-  const [goldPrice, setGoldPrice] = useState<number>(2375.45);
-  const [priceHistory, setPriceHistory] = useState<number[]>([
-    2370.10, 2371.40, 2368.50, 2372.20, 2374.80, 2373.15, 2375.40, 2374.90,
-    2376.10, 2374.30, 2373.80, 2375.20, 2377.10, 2376.50, 2375.45
-  ]);
+  // Ticker and Chart state. Price history starts empty and fills only from the live feed,
+  // so the high/low and chart never mix seeded numbers with real quotes.
+  const [goldPrice, setGoldPrice] = useState<number>(0);
+  const [priceHistory, setPriceHistory] = useState<number[]>([]);
   const [priceChange, setPriceChange] = useState<'up' | 'down' | null>(null);
   const [flashKey, setFlashKey] = useState<number>(0);
+  // Live gold price source: MT5 terminal via the bridge heartbeat. null = no live feed yet.
+  const [priceSource, setPriceSource] = useState<string | null>(null);
 
   // UI state
   const [activeTab, setActiveTab] = useState<'monitor' | 'setup' | 'settings' | 'trades' | 'sandbox' | 'quant'>('monitor');
@@ -327,44 +327,34 @@ export default function App() {
   });
   const [mt5Error, setMt5Error] = useState<string | null>(null);
 
-  // Generate historical balance growth over the last 30 days based on active account's current balance
+  // Real 30-day equity curve from actual closed trades. No synthetic drift: days with no
+  // trades are flat. Balance 30 days ago is derived as current minus the period's total PnL,
+  // then real daily PnL is added forward so the last point equals the current balance.
   const generateHistoricalPnLData = (currentBalance: number, trades: ClosedTrade[]) => {
-    const data = [];
+    const data: { date: string; balance: number; pnl: number }[] = [];
     const now = new Date();
-    
-    // Start with current balance and work backwards
-    let balance = currentBalance;
-    
-    // Create a day-by-day log for 30 days
+    const windowStart = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
+
+    const windowTrades = trades.filter(t => new Date(t.exitTime) >= windowStart);
+    const totalPnL = windowTrades.reduce((sum, t) => sum + t.pnl, 0);
+    const startingBalance = currentBalance - totalPnL;
+
+    let running = startingBalance;
     for (let i = 29; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
       const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      
-      // Filter trades occurring on this calendar day
-      const dayTrades = trades.filter(t => {
-        const tradeDate = new Date(t.exitTime);
-        return tradeDate.toDateString() === d.toDateString();
-      });
-      
-      // Calculate daily PnL changes
-      const dayPnL = dayTrades.reduce((sum, t) => sum + t.pnl, 0);
-      
-      // Safe, deterministic random drift based on the day of the month to keep the chart beautifully active
-      let randomDrift = 0;
-      if (dayTrades.length === 0) {
-        const seed = d.getDate();
-        randomDrift = (Math.sin(seed) * 12) + (Math.cos(seed * 1.5) * 4);
-      }
-      
-      const balanceOnDay = balance - dayPnL + randomDrift;
-      
+      const dayPnL = trades
+        .filter(t => new Date(t.exitTime).toDateString() === d.toDateString())
+        .reduce((sum, t) => sum + t.pnl, 0);
+
+      running += dayPnL;
       data.push({
         date: dateStr,
-        balance: Math.round(balanceOnDay * 100) / 100,
-        pnl: Math.round((balanceOnDay - 10000) * 100) / 100,
+        balance: Math.round(running * 100) / 100,
+        pnl: Math.round((running - startingBalance) * 100) / 100,
       });
     }
-    
+
     return data;
   };
 
@@ -415,14 +405,13 @@ export default function App() {
   const [genMessage, setGenMessage] = useState<string>('');
 
   // Performance & system metrics (simulated real-time)
-  const [systemMetrics, setSystemMetrics] = useState({
-    latency: '12.4ms',
-    cpu: '1.8%',
-    memory: '118MB',
-    winRate: 72,
-    profitFactor: 2.54,
-    tradesToday: 8,
-  });
+  // Real telemetry measured from the bridge poll. null = not yet known / offline.
+  const [bridgeMetrics, setBridgeMetrics] = useState<{
+    latencyMs: number | null;
+    bridgeAgeSec: number | null;
+    queueDepth: number | null;
+    connected: boolean;
+  }>({ latencyMs: null, bridgeAgeSec: null, queueDepth: null, connected: false });
 
   // Fetch initial data & start poll
   useEffect(() => {
@@ -652,47 +641,54 @@ export default function App() {
     }
   }, [activeTab]);
 
-  // Gold price simulator loop (ticks every 1s)
+  // Live gold price from the MT5 terminal via the bridge heartbeat.
+  // Per project rules, the price must be real market data -- no random walk. When the
+  // bridge has no fresh quote, the last known value is held and marked stale rather than
+  // invented.
   useEffect(() => {
-    const priceInterval = setInterval(() => {
-      setGoldPrice(prev => {
-        const change = (Math.random() - 0.5) * 0.8;
-        const newPrice = Number((prev + change).toFixed(2));
-        
-        if (newPrice > prev) {
-          setPriceChange('up');
-          setFlashKey(k => k + 1);
-        } else if (newPrice < prev) {
-          setPriceChange('down');
-          setFlashKey(k => k + 1);
-        }
-
-        setPriceHistory(history => {
-          const nextHistory = [...history, newPrice];
-          if (nextHistory.length > 25) {
-            nextHistory.shift();
-          }
-          return nextHistory;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const t0 = performance.now();
+        const res = await fetch('/api/bridge/status');
+        if (!res.ok || cancelled) return;
+        const s = await res.json();
+        const latencyMs = Math.round(performance.now() - t0);
+        setBridgeMetrics({
+          latencyMs,
+          bridgeAgeSec: s.lastHeartbeat ? Math.max(0, Math.round((Date.now() - s.lastHeartbeat) / 1000)) : null,
+          queueDepth: typeof s.queueDepth === 'number' ? s.queueDepth : null,
+          connected: !!s.connected,
         });
 
-        return newPrice;
-      });
-    }, 1500);
+        const live = typeof s.price === 'number' && s.price > 0;
+        setPriceSource(live ? (s.priceSymbol || 'MT5') : null);
+        if (!live) return;
 
-    return () => clearInterval(priceInterval);
-  }, []);
-
-  // Dynamic system metrics updates
-  useEffect(() => {
-    const metricsInterval = setInterval(() => {
-      setSystemMetrics(prev => ({
-        ...prev,
-        latency: `${(10 + Math.random() * 6).toFixed(1)}ms`,
-        cpu: `${(1 + Math.random() * 2).toFixed(1)}%`,
-        memory: `${Math.floor(115 + Math.random() * 8)}MB`,
-      }));
-    }, 3000);
-    return () => clearInterval(metricsInterval);
+        const newPrice = Number(s.price.toFixed(2));
+        setGoldPrice(prev => {
+          if (newPrice > prev) { setPriceChange('up'); setFlashKey(k => k + 1); }
+          else if (newPrice < prev) { setPriceChange('down'); setFlashKey(k => k + 1); }
+          if (newPrice !== prev) {
+            setPriceHistory(history => {
+              const next = [...history, newPrice];
+              while (next.length > 25) next.shift();
+              return next;
+            });
+          }
+          return newPrice;
+        });
+      } catch {
+        // Network blip: keep last known price, do not fabricate.
+        if (!cancelled) {
+          setPriceSource(null);
+          setBridgeMetrics(m => ({ ...m, connected: false, latencyMs: null }));
+        }
+      }
+    };
+    poll();
+    const priceInterval = setInterval(poll, 1500);
+    return () => { cancelled = true; clearInterval(priceInterval); };
   }, []);
 
   const fetchWithRetry = async (url: string, options?: RequestInit, retries = 5, delay = 1000): Promise<Response> => {
@@ -1076,18 +1072,27 @@ export default function App() {
     setTimeout(() => setCopiedText(null), 2000);
   };
 
-  const activeAccount = account.activeMode === 'live' && account.liveAccount 
-    ? account.liveAccount 
+  const activeAccount = account.activeMode === 'live' && account.liveAccount
+    ? account.liveAccount
     : account.paperAccount;
 
-  // Render simulated SVG chart path helper
+  // Regime module active-state, driven by real router data (no forced-on fallback).
+  const trendActive = settings.activeRegimeModule === 'trend' ||
+    (settings.activeRegimeModule === 'auto' && routerStats?.trend?.status === 'Active');
+  const rangeActive = settings.activeRegimeModule === 'range' ||
+    (settings.activeRegimeModule === 'auto' && routerStats?.range?.status === 'Active');
+  // Render a router stat, or an em dash when there is no real data yet.
+  const stat = (v: number | undefined, suffix = '') => (v == null ? '—' : `${v}${suffix}`);
+
+  // SVG chart path from the live price history. Empty/single-point history yields no path.
   const renderChartPath = () => {
+    if (priceHistory.length < 2) return '';
     const min = Math.min(...priceHistory);
     const max = Math.max(...priceHistory);
     const range = max - min || 1;
     const height = 120;
     const width = 450;
-    
+
     return priceHistory.map((val, idx) => {
       const x = (idx / (priceHistory.length - 1)) * width;
       // Invert Y coordinate so higher prices appear higher
@@ -1099,7 +1104,7 @@ export default function App() {
   // Extract variables for setup tab representation
   const webhookUrl = `${window.location.origin}/api/tradingview-webhook`;
   const samplePayload = {
-    passphrase: settings.webhookPassphrase || 'XAU_SECURE_99X_WG',
+    passphrase: settings.webhookPassphrase || 'YOUR_PASSPHRASE',
     action: 'buy',
     symbol: settings.defaultSymbol || 'XAUUSDT',
     volume: settings.defaultOrderSize || 0.1,
@@ -1137,16 +1142,22 @@ export default function App() {
         <div className="flex flex-wrap items-center gap-4 lg:gap-8 justify-between lg:justify-end">
           <div className="flex items-center gap-6 text-sm">
             <div className="text-right">
-              <div className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">LATENCY</div>
-              <div className="text-sm font-mono text-amber-500 font-bold">{systemMetrics.latency}</div>
+              <div className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">API</div>
+              <div className="text-sm font-mono text-amber-500 font-bold">
+                {bridgeMetrics.latencyMs != null ? `${bridgeMetrics.latencyMs}ms` : '—'}
+              </div>
             </div>
             <div className="text-right">
-              <div className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">CPU</div>
-              <div className="text-sm font-mono text-neutral-300 font-bold">{systemMetrics.cpu}</div>
+              <div className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">Bridge</div>
+              <div className={'text-sm font-mono font-bold ' + (bridgeMetrics.connected ? 'text-green-400' : 'text-red-500')}>
+                {bridgeMetrics.connected && bridgeMetrics.bridgeAgeSec != null ? `${bridgeMetrics.bridgeAgeSec}s ago` : 'OFFLINE'}
+              </div>
             </div>
             <div className="text-right">
-              <div className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">MEMORY</div>
-              <div className="text-sm font-mono text-neutral-300">{systemMetrics.memory}</div>
+              <div className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">Queue</div>
+              <div className="text-sm font-mono text-neutral-300">
+                {bridgeMetrics.queueDepth != null ? bridgeMetrics.queueDepth : '—'}
+              </div>
             </div>
           </div>
           
@@ -1164,7 +1175,7 @@ export default function App() {
       <div className="bg-neutral-900 border-b border-neutral-800 px-6 py-2.5 flex flex-wrap gap-x-8 gap-y-2 text-xs font-mono text-neutral-400">
         <div className="flex items-center gap-2">
           <span className="text-neutral-500 uppercase tracking-wider">ACTIVE PAIR:</span>
-          <span className="text-amber-500 font-bold">{settings.defaultSymbol}</span>
+          <span className="text-amber-500 font-bold">{settings.activeBroker === 'mt5' ? (priceSource || 'XAUUSD') : settings.defaultSymbol}</span>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-neutral-500 uppercase tracking-wider">LEVERAGE:</span>
@@ -1179,7 +1190,9 @@ export default function App() {
           <span className="text-neutral-300">{settings.stopLossPercent}% / {settings.takeProfitPercent}%</span>
         </div>
         <div className="ml-auto hidden md:flex items-center gap-4 text-neutral-500 text-[11px]">
-          <span>NETWORK: {settings.isTestnet ? 'BYBIT TESTNET' : 'BYBIT MAINNET'}</span>
+          <span>NETWORK: {settings.activeBroker === 'mt5'
+            ? `MT5 · ${settings.mt5Server || 'unknown server'}`
+            : (settings.isTestnet ? 'BYBIT TESTNET' : 'BYBIT MAINNET')}</span>
         </div>
       </div>
 
@@ -1597,7 +1610,14 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] font-black tracking-[0.2em] text-neutral-500 uppercase">SPOT EXCHANGE SPOTLIGHT</span>
-                    <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[9px] px-1.5 py-0.5 font-bold uppercase tracking-wider rounded">REAL-TIME WALK</span>
+                    {priceSource ? (
+                      <span className="bg-green-500/10 text-green-400 border border-green-500/20 text-[9px] px-1.5 py-0.5 font-bold uppercase tracking-wider rounded flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                        {priceSource} LIVE
+                      </span>
+                    ) : (
+                      <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[9px] px-1.5 py-0.5 font-bold uppercase tracking-wider rounded">AWAITING BRIDGE</span>
+                    )}
                   </div>
                   <h1 className="text-6xl md:text-7xl font-black tracking-tighter leading-none mt-2 font-mono">
                     <span className="text-neutral-600">$</span>
@@ -1611,23 +1631,25 @@ export default function App() {
                           : 'inline-block'
                       }
                     >
-                      {goldPrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      {goldPrice > 0 ? goldPrice.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '—.——'}
                     </span>
                   </h1>
                 </div>
 
                 <div className="flex gap-6 text-right pb-1">
                   <div>
-                    <div className="text-[9px] font-black text-neutral-500 uppercase tracking-widest">XAUUSD HIGHEST</div>
-                    <div className="text-base font-bold font-mono text-white">${Math.max(...priceHistory).toFixed(2)}</div>
+                    <div className="text-[9px] font-black text-neutral-500 uppercase tracking-widest">SESSION HIGH</div>
+                    <div className="text-base font-bold font-mono text-white">{priceHistory.length ? `$${Math.max(...priceHistory).toFixed(2)}` : '—'}</div>
                   </div>
                   <div>
-                    <div className="text-[9px] font-black text-neutral-500 uppercase tracking-widest font-mono">XAUUSD LOWEST</div>
-                    <div className="text-base font-bold font-mono text-neutral-400">${Math.min(...priceHistory).toFixed(2)}</div>
+                    <div className="text-[9px] font-black text-neutral-500 uppercase tracking-widest font-mono">SESSION LOW</div>
+                    <div className="text-base font-bold font-mono text-neutral-400">{priceHistory.length ? `$${Math.min(...priceHistory).toFixed(2)}` : '—'}</div>
                   </div>
                   <div>
-                    <div className="text-[9px] font-black text-green-400 uppercase tracking-widest font-mono">AVG WIN RATE</div>
-                    <div className="text-base font-bold font-mono text-green-400">{systemMetrics.winRate}%</div>
+                    <div className="text-[9px] font-black text-green-400 uppercase tracking-widest font-mono">WIN RATE</div>
+                    <div className="text-base font-bold font-mono text-green-400">
+                      {closedTrades.length ? `${Math.round((closedTrades.filter(t => t.pnl > 0).length / closedTrades.length) * 100)}%` : '—'}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1638,7 +1660,7 @@ export default function App() {
                   <h3 className="text-xs font-black text-neutral-500 uppercase tracking-[0.2em] flex items-center gap-1.5">
                     <span className="w-2 h-2 bg-amber-500 rounded-full animate-ping"></span> Live Execution Stream Engine
                   </h3>
-                  <span className="text-[10px] font-mono text-neutral-500">GRID RANGE: ${Math.min(...priceHistory).toFixed(1)} - ${Math.max(...priceHistory).toFixed(1)}</span>
+                  <span className="text-[10px] font-mono text-neutral-500">{priceHistory.length ? `RANGE: $${Math.min(...priceHistory).toFixed(1)} - $${Math.max(...priceHistory).toFixed(1)}` : 'AWAITING LIVE TICKS'}</span>
                 </div>
 
                 <div className="h-56 w-full bg-neutral-900 border border-neutral-800 flex items-center justify-center relative overflow-hidden">
@@ -1661,19 +1683,19 @@ export default function App() {
                       className="transition-all duration-300"
                     />
                     {/* Pulsing point on last price item */}
-                    {priceHistory.length > 0 && (
-                      <circle 
-                        cx={450} 
-                        cy={140 - ((priceHistory[priceHistory.length - 1] - Math.min(...priceHistory)) / (Math.max(...priceHistory) - Math.min(...priceHistory) || 1)) * 120 + 10} 
-                        r="5" 
-                        fill="#f59e0b" 
+                    {priceHistory.length > 1 && (
+                      <circle
+                        cx={450}
+                        cy={140 - ((priceHistory[priceHistory.length - 1] - Math.min(...priceHistory)) / (Math.max(...priceHistory) - Math.min(...priceHistory) || 1)) * 120 + 10}
+                        r="5"
+                        fill="#f59e0b"
                         className="animate-pulse"
                       />
                     )}
                   </svg>
                   
                   <div className="absolute bottom-4 left-4 bg-black/80 px-2 py-1 text-[10px] font-mono text-amber-500 border border-amber-500/20 tracking-wider">
-                    XAUUSDT TICK FREQUENCY: ~1.5S
+                    {priceSource ? `${priceSource} · LIVE FEED` : 'AWAITING BRIDGE'}
                   </div>
                 </div>
               </div>
@@ -1700,7 +1722,7 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {/* Trend Module Card */}
                   <div className={`border p-4 bg-neutral-950/80 relative transition-all ${
-                    (settings.activeRegimeModule === 'trend' || (settings.activeRegimeModule === 'auto' && (routerStats?.trend?.status === 'Active' || true)))
+                    trendActive
                       ? 'border-amber-500/30 shadow-[0_0_15px_rgba(245,158,11,0.05)]'
                       : 'border-neutral-800 opacity-60'
                   }`}>
@@ -1714,37 +1736,37 @@ export default function App() {
                         </span>
                       </div>
                       <span className={`text-[9px] font-mono font-black uppercase px-2 py-0.5 border ${
-                        (settings.activeRegimeModule === 'trend' || (settings.activeRegimeModule === 'auto' && (routerStats?.trend?.status === 'Active' || true)))
+                        trendActive
                           ? 'bg-amber-500/10 text-amber-500 border-amber-500/20 animate-pulse'
                           : 'bg-neutral-900 text-neutral-600 border-neutral-800'
                       }`}>
-                        {(settings.activeRegimeModule === 'trend' || (settings.activeRegimeModule === 'auto' && (routerStats?.trend?.status === 'Active' || true))) ? 'ACTIVE' : 'IDLE'}
+                        {trendActive ? 'ACTIVE' : 'IDLE'}
                       </span>
                     </div>
 
                     <div className="grid grid-cols-4 gap-1 border-t border-neutral-900 pt-3">
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">TRADES</span>
-                        <span className="text-sm font-bold font-mono text-neutral-200">{(routerStats || { trend: { tradesCount: 14 } }).trend.tradesCount}</span>
+                        <span className="text-sm font-bold font-mono text-neutral-200">{stat(routerStats?.trend?.tradesCount)}</span>
                       </div>
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">WIN RATE</span>
-                        <span className="text-sm font-bold font-mono text-green-400">{(routerStats || { trend: { winRate: 64.3 } }).trend.winRate}%</span>
+                        <span className="text-sm font-bold font-mono text-green-400">{stat(routerStats?.trend?.winRate, '%')}</span>
                       </div>
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">TOTAL PNL</span>
-                        <span className="text-sm font-bold font-mono text-emerald-400">+${(routerStats || { trend: { totalPnl: 1840.50 } }).trend.totalPnl.toFixed(2)}</span>
+                        <span className="text-sm font-bold font-mono text-emerald-400">{routerStats?.trend ? `$${routerStats.trend.totalPnl.toFixed(2)}` : '—'}</span>
                       </div>
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">EXPECTANCY</span>
-                        <span className="text-sm font-bold font-mono text-amber-500">{(routerStats || { trend: { expectancyR: 2.1 } }).trend.expectancyR}R</span>
+                        <span className="text-sm font-bold font-mono text-amber-500">{stat(routerStats?.trend?.expectancyR, 'R')}</span>
                       </div>
                     </div>
                   </div>
 
                   {/* Range Module Card */}
                   <div className={`border p-4 bg-neutral-950/80 relative transition-all ${
-                    (settings.activeRegimeModule === 'range' || (settings.activeRegimeModule === 'auto' && (routerStats?.range?.status === 'Active' || false)))
+                    rangeActive
                       ? 'border-amber-500/30 shadow-[0_0_15px_rgba(245,158,11,0.05)]'
                       : 'border-neutral-800 opacity-60'
                   }`}>
@@ -1758,30 +1780,30 @@ export default function App() {
                         </span>
                       </div>
                       <span className={`text-[9px] font-mono font-black uppercase px-2 py-0.5 border ${
-                        (settings.activeRegimeModule === 'range' || (settings.activeRegimeModule === 'auto' && (routerStats?.range?.status === 'Active' || false)))
+                        rangeActive
                           ? 'bg-amber-500/10 text-amber-500 border-amber-500/20 animate-pulse'
                           : 'bg-neutral-900 text-neutral-600 border-neutral-800'
                       }`}>
-                        {(settings.activeRegimeModule === 'range' || (settings.activeRegimeModule === 'auto' && (routerStats?.range?.status === 'Active' || false))) ? 'ACTIVE' : 'IDLE'}
+                        {rangeActive ? 'ACTIVE' : 'IDLE'}
                       </span>
                     </div>
 
                     <div className="grid grid-cols-4 gap-1 border-t border-neutral-900 pt-3">
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">TRADES</span>
-                        <span className="text-sm font-bold font-mono text-neutral-200">{(routerStats || { range: { tradesCount: 22 } }).range.tradesCount}</span>
+                        <span className="text-sm font-bold font-mono text-neutral-200">{stat(routerStats?.range?.tradesCount)}</span>
                       </div>
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">WIN RATE</span>
-                        <span className="text-sm font-bold font-mono text-green-400">{(routerStats || { range: { winRate: 72.7 } }).range.winRate}%</span>
+                        <span className="text-sm font-bold font-mono text-green-400">{stat(routerStats?.range?.winRate, '%')}</span>
                       </div>
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">TOTAL PNL</span>
-                        <span className="text-sm font-bold font-mono text-emerald-400">+${(routerStats || { range: { totalPnl: 1250.20 } }).range.totalPnl.toFixed(2)}</span>
+                        <span className="text-sm font-bold font-mono text-emerald-400">{routerStats?.range ? `$${routerStats.range.totalPnl.toFixed(2)}` : '—'}</span>
                       </div>
                       <div>
                         <span className="text-[8px] font-mono text-neutral-500 block uppercase">EXPECTANCY</span>
-                        <span className="text-sm font-bold font-mono text-amber-500">{(routerStats || { range: { expectancyR: 1.4 } }).range.expectancyR}R</span>
+                        <span className="text-sm font-bold font-mono text-amber-500">{stat(routerStats?.range?.expectancyR, 'R')}</span>
                       </div>
                     </div>
                   </div>
