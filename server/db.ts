@@ -227,7 +227,7 @@ const defaultDb: DbSchema = {
       id: 'log-1',
       timestamp: new Date(Date.now() - 4 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'XAU_SECURE_99X_WG',
+        passphrase: '••••••',
         action: 'buy',
         symbol: 'XAUUSDT',
         price: 2362.45,
@@ -246,7 +246,7 @@ const defaultDb: DbSchema = {
       id: 'log-2',
       timestamp: new Date(Date.now() - 3.5 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'XAU_SECURE_99X_WG',
+        passphrase: '••••••',
         action: 'sell',
         symbol: 'XAUUSDT',
         price: 2368.10,
@@ -265,7 +265,7 @@ const defaultDb: DbSchema = {
       id: 'log-3',
       timestamp: new Date(Date.now() - 2 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'WRONG_SECRET',
+        passphrase: '••••••',
         action: 'buy',
         symbol: 'XAUUSDT',
         price: 2365.20,
@@ -283,7 +283,7 @@ const defaultDb: DbSchema = {
       id: 'log-4',
       timestamp: new Date(Date.now() - 1 * 3600000).toISOString(),
       rawBody: {
-        passphrase: 'XAU_SECURE_99X_WG',
+        passphrase: '••••••',
         action: 'close',
         symbol: 'XAUUSDT',
         price: 2371.30,
@@ -523,10 +523,27 @@ export class Database {
     return db.settings;
   }
 
+  // Secrets must never reach the logs blob: it is served to the dashboard and stored in
+  // db.json. Redact centrally so no call site can leak by passing a raw request body.
+  private static redactSecrets(body: any): any {
+    if (!body || typeof body !== 'object') return body;
+    const SECRET_KEYS = ['passphrase', 'password', 'secret', 'token', 'apiKey', 'apiSecret'];
+    const clone: Record<string, any> = Array.isArray(body) ? [...body] : { ...body };
+    for (const k of Object.keys(clone)) {
+      if (SECRET_KEYS.some(s => k.toLowerCase().includes(s.toLowerCase()))) {
+        clone[k] = '••••••';
+      } else if (clone[k] && typeof clone[k] === 'object') {
+        clone[k] = this.redactSecrets(clone[k]);
+      }
+    }
+    return clone;
+  }
+
   public static addLog(log: Omit<WebhookLog, 'id' | 'timestamp'>): WebhookLog {
     const db = this.get();
     const newLog: WebhookLog = {
       ...log,
+      rawBody: this.redactSecrets((log as any).rawBody),
       id: 'log-' + Math.random().toString(36).substr(2, 9),
       timestamp: new Date().toISOString(),
     };
