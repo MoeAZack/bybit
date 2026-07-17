@@ -231,6 +231,7 @@ app.post('/api/settings', (req, res) => {
       activeRegimeModule,
       // MT5 fields
       activeBroker,
+      mt5AccountType,
       mt5Host,
       mt5Login,
       mt5Password,
@@ -264,6 +265,7 @@ app.post('/api/settings', (req, res) => {
       activeRegimeModule: activeRegimeModule !== undefined ? activeRegimeModule : db.settings.activeRegimeModule,
       // MT5 fields
       activeBroker: activeBroker !== undefined ? activeBroker : db.settings.activeBroker,
+      mt5AccountType: mt5AccountType !== undefined ? mt5AccountType : db.settings.mt5AccountType,
       mt5Host: mt5Host !== undefined ? mt5Host : db.settings.mt5Host,
       mt5Login: mt5Login !== undefined ? mt5Login : db.settings.mt5Login,
       mt5Server: mt5Server !== undefined ? mt5Server : db.settings.mt5Server,

@@ -162,6 +162,7 @@ interface SettingsState {
   };
   // MT5 Prop-Firm settings
   activeBroker: 'bybit' | 'mt5';
+  mt5AccountType: 'demo' | 'funded';
   mt5Host: string;
   mt5Login: string;
   mt5Password: string;
@@ -244,6 +245,7 @@ export default function App() {
     },
     // MT5 Prop-Firm defaults
     activeBroker: 'bybit',
+    mt5AccountType: 'demo',
     mt5Host: 'http://localhost:5000',
     mt5Login: '',
     mt5Password: '',
@@ -559,6 +561,34 @@ export default function App() {
       }
     } catch (e) {
       console.error('Error selecting MT5 account', e);
+    }
+  };
+
+  // Main-page venue switch. Writes only the routing fields; paper/live is managed
+  // separately in Settings, deliberately untouched here.
+  const [venueSwitching, setVenueSwitching] = useState(false);
+  const handleSelectVenue = async (
+    broker: 'bybit' | 'mt5',
+    accountType: 'demo' | 'funded' = settings.mt5AccountType,
+  ) => {
+    setVenueSwitching(true);
+    // Optimistic: reflect the choice immediately, reconcile on refetch.
+    setSettings(prev => ({ ...prev, activeBroker: broker, mt5AccountType: accountType }));
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ activeBroker: broker, mt5AccountType: accountType }),
+      });
+      if (res.ok) {
+        await fetchSettings();
+        await fetchPositions();
+      }
+    } catch (e) {
+      console.error('Error switching venue', e);
+      await fetchSettings();
+    } finally {
+      setVenueSwitching(false);
     }
   };
 
@@ -1525,6 +1555,43 @@ export default function App() {
 
             {/* MIDDLE/RIGHT COLUMN: GOLD TICKER, INTERACTIVE SVG CHART & WEBHOOK EVENT LOGS */}
             <section className="col-span-12 lg:col-span-8 bg-neutral-950 flex flex-col border-l border-neutral-800">
+              {/* VENUE SWITCH */}
+              <div className="px-6 py-3 border-b border-neutral-800 bg-neutral-950 flex items-center gap-3 flex-wrap">
+                <span className="text-[9px] font-black text-neutral-500 uppercase tracking-[0.2em]">Active Venue</span>
+                <div className="inline-flex border border-neutral-700 rounded overflow-hidden">
+                  {([
+                    { label: 'Bybit', broker: 'bybit' as const, type: 'demo' as const, dot: 'bg-amber-500' },
+                    { label: 'MT5 Demo', broker: 'mt5' as const, type: 'demo' as const, dot: 'bg-sky-400' },
+                    { label: 'Funded', broker: 'mt5' as const, type: 'funded' as const, dot: 'bg-green-500' },
+                  ]).map(v => {
+                    const active =
+                      settings.activeBroker === v.broker &&
+                      (v.broker === 'bybit' || settings.mt5AccountType === v.type);
+                    return (
+                      <button
+                        key={v.label}
+                        type="button"
+                        disabled={venueSwitching}
+                        onClick={() => handleSelectVenue(v.broker, v.type)}
+                        className={
+                          'flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-black uppercase tracking-wider border-none cursor-pointer transition-all ' +
+                          (active
+                            ? 'bg-neutral-100 text-neutral-950'
+                            : 'bg-neutral-900 text-neutral-400 hover:bg-neutral-800') +
+                          (venueSwitching ? ' opacity-60 cursor-wait' : '')
+                        }
+                      >
+                        <span className={'w-1.5 h-1.5 rounded-full ' + v.dot}></span>
+                        {v.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <span className="text-[9px] font-mono text-neutral-600">
+                  Routing only — paper/live stays in Settings
+                </span>
+              </div>
+
               {/* TICKER STATS BAR */}
               <div className="p-6 border-b border-neutral-800 flex flex-wrap justify-between items-end gap-4 bg-neutral-900/30">
                 <div>

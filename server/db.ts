@@ -91,6 +91,9 @@ export interface TradingSettings {
   reversion: ReversionSettings;
   // MT5 Prop-Firm settings
   activeBroker: 'bybit' | 'mt5';
+  // Which MT5 credential profile the venue switch targets. Distinguishes the two mt5
+  // positions ("MT5 Demo" vs "Funded") without changing the routing itself.
+  mt5AccountType: 'demo' | 'funded';
   mt5Host: string;
   mt5Login: string;
   mt5Password: string;
@@ -210,6 +213,7 @@ const defaultDb: DbSchema = {
       maxSpreadUsd: 0.60,
     },
     activeBroker: 'bybit',
+    mt5AccountType: 'demo',
     mt5Host: 'http://localhost:5000',
     mt5Login: '',
     mt5Password: '',
