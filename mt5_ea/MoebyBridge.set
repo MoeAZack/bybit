@@ -1,9 +1,9 @@
-InpServerURL=https://ais-pre-fmo6wt7g7xeegy6cjxblaz-15203882409.europe-west2.run.app
-InpBridgeToken=MoeAZack
+InpServerURL=https://moeby-w47weolqnq-ew.a.run.app
+InpBridgeToken=CHANGE_ME
 InpPollMs=1500
 InpHeartbeatSec=20
 InpMagic=880088
 InpMaxVolume=0.10
-InpSymbolAllow=XAUUSD
+InpSymbolAllow=XAUUSD,XAUUSDT
 InpSlippagePts=30
 InpArmedOnStart=false

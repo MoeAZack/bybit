@@ -203,11 +203,13 @@ function fmtCommand(c: BridgeCommand): string {
 }
 
 function bridgeAuth(req: Request, res: Response, next: NextFunction) {
-  const expected = process.env.MT5_BRIDGE_TOKEN;
+  // Trim both sides: a secret pasted into the Secret Manager console, or generated on a
+  // CRLF shell, picks up trailing whitespace that is invisible in every UI that shows it.
+  const expected = (process.env.MT5_BRIDGE_TOKEN || '').trim();
   if (!expected) {
     return res.status(503).send('MT5_BRIDGE_TOKEN not configured on server');
   }
-  const got = String(req.headers['x-bridge-token'] || req.query.token || '');
+  const got = String(req.headers['x-bridge-token'] || req.query.token || '').trim();
   // constant-time compare
   const a = Buffer.from(got);
   const b = Buffer.from(expected);

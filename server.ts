@@ -21,7 +21,8 @@ import { OpsAlertsManager } from './server/opsAlerts.js';
 import { ResearchDeskManager } from './server/researchDesk.js';
 
 const app = express();
-const PORT = 3000;
+// Cloud Run injects PORT and health-checks that port; a hardcoded value fails startup there.
+const PORT = Number(process.env.PORT) || 3000;
 
 // For parsing JSON and urlencoded request bodies
 app.use(express.json());
@@ -47,21 +48,67 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
+const SESSION_COOKIE = 'moeby_session';
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+function sessionKey(): string | null {
+  const t = process.env.API_AUTH_TOKEN;
+  return t && t.trim() ? t.trim() : null;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function mintSession(key: string): string {
+  const payload = String(Date.now() + SESSION_TTL_MS);
+  const sig = crypto.createHmac('sha256', key).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+function verifySession(raw: string, key: string): boolean {
+  const dot = raw.lastIndexOf('.');
+  if (dot <= 0) return false;
+  const payload = raw.slice(0, dot);
+  const expected = crypto.createHmac('sha256', key).update(payload).digest('hex');
+  if (!safeEqual(raw.slice(dot + 1), expected)) return false;
+  const expires = Number(payload);
+  return Number.isFinite(expires) && Date.now() < expires;
+}
+
+function readCookie(req: express.Request, name: string): string | null {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0 && part.slice(0, eq).trim() === name) {
+      return decodeURIComponent(part.slice(eq + 1).trim());
+    }
+  }
+  return null;
+}
+
 // REST API Security & IP Whitelist Enforcer Middleware
 function apiAuthMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
-  // Exclude the TradingView webhook itself from API_AUTH_TOKEN header checks
+  // The webhook authenticates on the passphrase in its body instead — TradingView cannot
+  // attach custom headers. That route fails closed when no passphrase is configured.
   if (req.path === '/tradingview-webhook') {
     return next();
   }
 
-  // Exclude same-origin requests (the frontend dashboard running on the same host)
-  const host = req.headers.host;
-  const referer = req.headers.referer;
-  const isSameOrigin = (req.headers['sec-fetch-site'] === 'same-origin') || 
-                       (referer && host && referer.includes(host));
-
-  if (isSameOrigin) {
+  // Deliberate opt-out for the public demo. Must be set explicitly: a missing token still
+  // fails closed, so the service can never end up open just because config went astray.
+  if (process.env.DISABLE_API_AUTH === 'true') {
     return next();
+  }
+
+  const key = sessionKey();
+  if (!key) {
+    // Fail closed. An unset token used to mean "skip the check", leaving every route open.
+    return res.status(503).json({ error: 'Server auth is not configured (API_AUTH_TOKEN).' });
   }
 
   const db = Database.get();
@@ -75,16 +122,63 @@ function apiAuthMiddleware(req: express.Request, res: express.Response, next: ex
     }
   }
 
-  const expectedToken = process.env.API_AUTH_TOKEN;
-  if (expectedToken) {
-    const receivedToken = req.headers['authorization'] || req.headers['x-api-token'];
-    const tokenStr = String(receivedToken || '').replace(/^Bearer\s+/i, '').trim();
-    if (tokenStr !== expectedToken.trim()) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid API Auth Token.' });
-    }
+  // The dashboard proves same-origin by holding a signed session cookie, which it gets by
+  // exchanging the token at /api/auth/login. Header-based origin claims are not usable here:
+  // sec-fetch-site and referer are set by the caller, so any curl can assert them.
+  const cookie = readCookie(req, SESSION_COOKIE);
+  if (cookie && verifySession(cookie, key)) {
+    return next();
   }
-  next();
+
+  const receivedToken = req.headers['authorization'] || req.headers['x-api-token'];
+  const tokenStr = String(receivedToken || '').replace(/^Bearer\s+/i, '').trim();
+  if (tokenStr && safeEqual(tokenStr, key)) {
+    return next();
+  }
+
+  return res.status(401).json({ error: 'Unauthorized: Invalid API Auth Token.' });
 }
+
+// Login is registered ahead of the guard so it stays reachable without a session.
+const loginFailures = new Map<string, { count: number; until: number }>();
+
+app.post('/api/auth/login', (req, res) => {
+  const key = sessionKey();
+  if (!key) {
+    return res.status(503).json({ error: 'Server auth is not configured (API_AUTH_TOKEN).' });
+  }
+
+  const ip = ((req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '')
+    .split(',')[0].trim();
+  const entry = loginFailures.get(ip);
+  if (entry && entry.count >= 5 && Date.now() < entry.until) {
+    return res.status(429).json({ error: 'Too many attempts. Try again later.' });
+  }
+
+  const supplied = String((req.body && req.body.token) || '').trim();
+  if (!supplied || !safeEqual(supplied, key)) {
+    const next = { count: (entry?.count ?? 0) + 1, until: Date.now() + 15 * 60 * 1000 };
+    loginFailures.set(ip, next);
+    return res.status(401).json({ error: 'Invalid token.' });
+  }
+
+  loginFailures.delete(ip);
+  const attrs = [
+    `${SESSION_COOKIE}=${mintSession(key)}`,
+    'HttpOnly',
+    'Path=/',
+    'SameSite=Strict',
+    `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+  ];
+  if (process.env.NODE_ENV === 'production') attrs.push('Secure');
+  res.setHeader('Set-Cookie', attrs.join('; '));
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/logout', (_req, res) => {
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0`);
+  res.json({ ok: true });
+});
 
 // REST API Endpoints
 app.use('/api', apiAuthMiddleware);
@@ -799,22 +893,25 @@ app.post('/api/tradingview-webhook', async (req, res) => {
 
     console.log('Received Webhook alert payload:', payload);
 
-    // 1. Authenticate passphrase
-    if (settings.webhookPassphrase) {
-      const receivedPass = payload.passphrase || payload.password || payload.secret;
-      if (receivedPass !== settings.webhookPassphrase) {
-        const log = Database.addLog({
-          rawBody: payload,
-          status: 'auth_failed',
-          action: 'none',
-          symbol: payload.symbol || settings.defaultSymbol,
-          price: Number(payload.price || 0),
-          quantity: Number(payload.volume || payload.quantity || settings.defaultOrderSize),
-          message: `Unauthorized Webhook: Received secret "${receivedPass}" did not match terminal secret.`,
-          mode: settings.isPaperTrading ? 'paper' : 'live',
-        });
-        return res.status(401).json({ error: 'Unauthorized', logId: log.id });
-      }
+    // 1. Authenticate passphrase.
+    // Fail closed: this route is exempt from the API token guard, so an unset passphrase
+    // would let any unauthenticated caller place trades.
+    const expectedPass = settings.webhookPassphrase ? String(settings.webhookPassphrase).trim() : '';
+    const receivedPass = String(payload.passphrase || payload.password || payload.secret || '').trim();
+    if (!expectedPass || !safeEqual(receivedPass, expectedPass)) {
+      const log = Database.addLog({
+        rawBody: { ...payload, passphrase: undefined, password: undefined, secret: undefined },
+        status: 'auth_failed',
+        action: 'none',
+        symbol: payload.symbol || settings.defaultSymbol,
+        price: Number(payload.price || 0),
+        quantity: Number(payload.volume || payload.quantity || settings.defaultOrderSize),
+        message: expectedPass
+          ? 'Unauthorized Webhook: passphrase did not match terminal secret.'
+          : 'Rejected Webhook: no webhookPassphrase configured on this terminal.',
+        mode: settings.isPaperTrading ? 'paper' : 'live',
+      });
+      return res.status(401).json({ error: 'Unauthorized', logId: log.id });
     }
 
     // 2. Extract Action & Parameters
@@ -1409,6 +1506,14 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
+
+    if (process.env.DISABLE_API_AUTH === 'true') {
+      console.warn('*'.repeat(78));
+      console.warn('DISABLE_API_AUTH=true — every /api/* route is open to anyone with the URL.');
+      console.warn('Intended for the demo account only. Before connecting live Bybit keys,');
+      console.warn('remove this variable so API_AUTH_TOKEN is enforced again.');
+      console.warn('*'.repeat(78));
+    }
 
     // STARTUP RECONCILIATION & MONITORING TASK
     const db = Database.get();
