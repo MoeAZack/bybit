@@ -163,6 +163,10 @@ interface SettingsState {
   // MT5 Prop-Firm settings
   activeBroker: 'bybit' | 'mt5';
   mt5AccountType: 'demo' | 'funded';
+  mt5AutoMode: 'off' | 'approve' | 'auto';
+  signalCandleMinutes: number;
+  isCircuitBreakerActive: boolean;
+  maxDrawdownPercent: number;
   mt5Host: string;
   mt5Login: string;
   mt5Password: string;
@@ -246,6 +250,10 @@ export default function App() {
     // MT5 Prop-Firm defaults
     activeBroker: 'bybit',
     mt5AccountType: 'demo',
+    mt5AutoMode: 'off',
+    signalCandleMinutes: 5,
+    isCircuitBreakerActive: false,
+    maxDrawdownPercent: 5,
     mt5Host: 'http://localhost:5000',
     mt5Login: '',
     mt5Password: '',
@@ -275,6 +283,29 @@ export default function App() {
   const [flashKey, setFlashKey] = useState<number>(0);
   // Live gold price source: MT5 terminal via the bridge heartbeat. null = no live feed yet.
   const [priceSource, setPriceSource] = useState<string | null>(null);
+  // Server-generated signals awaiting one-click approval (approve mode).
+  const [pendingSignals, setPendingSignals] = useState<Array<{
+    id: string; side: 'buy' | 'sell'; symbol: string; price: number; quantity: number; reason: string; createdAt: number;
+  }>>([]);
+  // P&L calendar: which month is shown (first of month).
+  const [calMonth, setCalMonth] = useState<Date>(() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); });
+  // AI trade review.
+  const [review, setReview] = useState<{ stats: any; report: string } | null>(null);
+  const [reviewLoading, setReviewLoading] = useState(false);
+
+  const handleGenerateReview = async () => {
+    setReviewLoading(true);
+    try {
+      const res = await fetch('/api/trades/review', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) { showCustomAlert('Review failed', data.error || 'Unknown error'); return; }
+      setReview(data);
+    } catch (e: any) {
+      showCustomAlert('Error', `Review failed: ${e.message}`);
+    } finally {
+      setReviewLoading(false);
+    }
+  };
 
   // UI state
   const [activeTab, setActiveTab] = useState<'monitor' | 'setup' | 'settings' | 'trades' | 'sandbox' | 'quant'>('monitor');
@@ -358,6 +389,26 @@ export default function App() {
     return data;
   };
 
+  // Daily realized P&L for a given month, keyed by day-of-month, from real closed trades.
+  const buildPnLCalendar = (month: Date, trades: ClosedTrade[]) => {
+    const year = month.getFullYear();
+    const mon = month.getMonth();
+    const daysInMonth = new Date(year, mon + 1, 0).getDate();
+    const firstWeekday = new Date(year, mon, 1).getDay(); // 0=Sun
+    const byDay: Record<number, { pnl: number; count: number }> = {};
+    for (const t of trades) {
+      const d = new Date(t.exitTime);
+      if (d.getFullYear() === year && d.getMonth() === mon) {
+        const day = d.getDate();
+        if (!byDay[day]) byDay[day] = { pnl: 0, count: 0 };
+        byDay[day].pnl += t.pnl;
+        byDay[day].count += 1;
+      }
+    }
+    const monthPnl = Object.values(byDay).reduce((s, v) => s + v.pnl, 0);
+    return { year, mon, daysInMonth, firstWeekday, byDay, monthPnl };
+  };
+
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [showMt5Guide, setShowMt5Guide] = useState(false);
@@ -389,6 +440,53 @@ export default function App() {
   const [backtestResult, setBacktestResult] = useState<any | null>(null);
   const [backtestLoading, setBacktestLoading] = useState<boolean>(false);
   const [backtestError, setBacktestError] = useState<string | null>(null);
+
+  // Parameter optimizer state. Each sweepable param has a preset range; the user toggles
+  // which ones to include. Fewer selected = fewer combinations = faster.
+  const OPTIMIZER_RANGES: Record<string, { label: string; values: number[] }> = {
+    fastEma: { label: 'Fast EMA', values: [8, 12, 20] },
+    slowEma: { label: 'Slow EMA', values: [26, 50, 100] },
+    atrMultiplierSL: { label: 'SL × ATR', values: [1.0, 1.5, 2.0] },
+    atrMultiplierTP: { label: 'TP × ATR', values: [2.0, 3.0, 4.0] },
+    adxThreshold: { label: 'ADX threshold', values: [18, 22, 26, 30] },
+    rsiOversold: { label: 'RSI oversold', values: [25, 30, 35] },
+  };
+  const [optSweeps, setOptSweeps] = useState<string[]>(['atrMultiplierSL', 'atrMultiplierTP']);
+  const [optRankBy, setOptRankBy] = useState<'expectancyR' | 'expectancy' | 'profitFactor' | 'winRate' | 'netPnl'>('expectancyR');
+  const [optResults, setOptResults] = useState<any[] | null>(null);
+  const [optLoading, setOptLoading] = useState(false);
+  const [optMeta, setOptMeta] = useState<{ ran: number; capped: boolean } | null>(null);
+
+  const optComboCount = optSweeps.reduce((n, k) => n * (OPTIMIZER_RANGES[k]?.values.length || 1), 1);
+
+  const handleOptimize = async () => {
+    if (optSweeps.length === 0) { showCustomAlert('Pick a parameter', 'Select at least one parameter to sweep.'); return; }
+    setOptLoading(true);
+    setOptResults(null);
+    try {
+      const sweeps: Record<string, number[]> = {};
+      for (const k of optSweeps) sweeps[k] = OPTIMIZER_RANGES[k].values;
+      const res = await fetch('/api/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...backtestParams, sweeps, rankBy: optRankBy, maxCombos: 60 }),
+      });
+      const data = await res.json();
+      if (!res.ok) { showCustomAlert('Optimize failed', data.error || 'Unknown error'); return; }
+      setOptResults(data.ranked || []);
+      setOptMeta({ ran: data.ran, capped: data.capped });
+    } catch (e: any) {
+      showCustomAlert('Error', `Optimizer failed: ${e.message}`);
+    } finally {
+      setOptLoading(false);
+    }
+  };
+
+  const applyOptimizedParams = (swept: Record<string, number>) => {
+    setBacktestParams(prev => ({ ...prev, ...swept }));
+    setBacktestResult(null);
+    showCustomAlert('Applied', 'Winning parameters loaded into the backtest form. Run a backtest to confirm, then copy them into your live settings.');
+  };
   
   // Custom manual simulation tool state
   const [simAction, setSimAction] = useState<'buy' | 'sell' | 'close'>('buy');
@@ -420,12 +518,14 @@ export default function App() {
     fetchPositions();
     fetchRouterStats();
     fetchMT5Accounts();
+    fetchPendingSignals();
 
     const interval = setInterval(() => {
       fetchLogs();
       fetchPositions();
       fetchRouterStats();
       fetchMT5Accounts();
+      fetchPendingSignals();
     }, 2000);
 
     return () => clearInterval(interval);
@@ -578,6 +678,38 @@ export default function App() {
       await fetchSettings();
     } finally {
       setVenueSwitching(false);
+    }
+  };
+
+  // Poll pending signals while in approve mode so the panel stays current.
+  const fetchPendingSignals = async () => {
+    try {
+      const res = await fetch('/api/signals');
+      if (res.ok) setPendingSignals(await res.json());
+    } catch {
+      /* transient; keep last known */
+    }
+  };
+
+  const handleApproveSignal = async (id: string) => {
+    try {
+      const res = await fetch(`/api/signals/${id}/approve`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) showCustomAlert('Signal not fired', data.error || 'Execution was blocked.');
+      await fetchPendingSignals();
+      await fetchPositions();
+      await fetchLogs();
+    } catch (e: any) {
+      showCustomAlert('Error', `Could not approve signal: ${e.message}`);
+    }
+  };
+
+  const handleDismissSignal = async (id: string) => {
+    try {
+      await fetch(`/api/signals/${id}/dismiss`, { method: 'POST' });
+      await fetchPendingSignals();
+    } catch (e) {
+      console.error('dismiss signal failed', e);
     }
   };
 
@@ -1272,6 +1404,68 @@ export default function App() {
         {/* TAB 1: TERMINAL MONITOR (MAIN PANEL) */}
         {activeTab === 'monitor' && (
           <>
+            {/* SERVER SIGNAL AUTOMATION BANNER */}
+            {settings.activeBroker === 'mt5' && settings.mt5AutoMode !== 'off' && (
+              <section className="col-span-12 bg-neutral-950 border-b border-neutral-800 px-6 py-4">
+                <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span>
+                    <span className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-300">
+                      Signal Automation
+                    </span>
+                    <span className={'text-[9px] font-black uppercase px-2 py-0.5 border tracking-wider ' +
+                      (settings.mt5AutoMode === 'auto'
+                        ? 'bg-red-500/10 text-red-400 border-red-500/30'
+                        : 'bg-sky-500/10 text-sky-400 border-sky-500/30')}>
+                      {settings.mt5AutoMode === 'auto' ? 'AUTONOMOUS — HANDS OFF' : 'APPROVE TO FIRE'}
+                    </span>
+                  </div>
+                  <span className="text-[9px] font-mono text-neutral-600">
+                    Server evaluates a signal each 15m candle close. Change mode in Settings.
+                  </span>
+                </div>
+
+                {settings.mt5AutoMode === 'approve' && (
+                  pendingSignals.length === 0 ? (
+                    <div className="text-[11px] font-mono text-neutral-500">No pending signals — waiting for the next qualifying candle.</div>
+                  ) : (
+                    <div className="flex flex-col gap-2">
+                      {pendingSignals.map(sig => (
+                        <div key={sig.id} className="flex items-center justify-between gap-3 flex-wrap bg-neutral-900 border border-neutral-800 px-3 py-2">
+                          <div className="flex items-center gap-3">
+                            <span className={'text-xs font-black uppercase px-2 py-1 ' +
+                              (sig.side === 'buy' ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400')}>
+                              {sig.side === 'buy' ? 'BUY' : 'SELL'} {sig.symbol}
+                            </span>
+                            <span className="text-[11px] font-mono text-neutral-300">
+                              {sig.quantity} lot @ ${sig.price.toFixed(2)}
+                            </span>
+                            <span className="text-[9px] font-mono text-neutral-500 hidden md:inline">{sig.reason}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleApproveSignal(sig.id)}
+                              className="bg-green-600 hover:bg-green-500 text-white font-black text-[10px] uppercase tracking-wider px-4 py-1.5 border-none cursor-pointer transition-all"
+                            >
+                              Fire
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDismissSignal(sig.id)}
+                              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-black text-[10px] uppercase tracking-wider px-3 py-1.5 border-none cursor-pointer transition-all"
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                )}
+              </section>
+            )}
+
             {/* LEFT COLUMN: ACTIVE POSITIONS AND PAPER BALANCE */}
             <section className="col-span-12 lg:col-span-4 bg-neutral-950 p-6 flex flex-col gap-6" id="positions-column">
               <div>
@@ -3133,6 +3327,104 @@ if __name__ == '__main__':
                     </span>
                   </div>
                 </div>
+
+                {/* INTRADAY EQUITY CIRCUIT BREAKER */}
+                <div className="mt-6 pt-6 border-t border-neutral-800">
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    <div>
+                      <span className="text-[10px] font-black text-amber-500 uppercase tracking-widest block mb-1">Intraday Equity Circuit Breaker</span>
+                      <span className="text-[10px] text-neutral-500 block max-w-md leading-relaxed">
+                        Auto-flattens all positions and trips the kill switch when equity drops past the limit
+                        from the day's start. Covers open-position losses the entry-only daily-loss veto misses.
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSettings({ ...settings, isCircuitBreakerActive: !settings.isCircuitBreakerActive })}
+                      className={'px-4 py-2 text-[10px] font-black uppercase tracking-wider border cursor-pointer transition-all ' +
+                        (settings.isCircuitBreakerActive ? 'bg-amber-500 border-amber-400 text-neutral-950' : 'bg-neutral-900 border-neutral-700 text-neutral-400 hover:bg-neutral-800')}
+                    >
+                      {settings.isCircuitBreakerActive ? 'ARMED' : 'DISABLED'}
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-3 mt-3">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-neutral-400">Max drawdown</span>
+                    <input
+                      type="number"
+                      step="0.5"
+                      min="1"
+                      value={settings.maxDrawdownPercent}
+                      onChange={(e: any) => setSettings({ ...settings, maxDrawdownPercent: Number(e.target.value) })}
+                      className="w-20 bg-neutral-900 border border-neutral-700 text-neutral-200 text-[11px] font-mono px-2 py-1.5 outline-none"
+                    />
+                    <span className="text-[10px] font-mono text-neutral-500">% from day-start equity → flatten &amp; halt</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* MT5 SIGNAL AUTOMATION MODE */}
+              <div className="border border-neutral-800 bg-neutral-950/60 p-5">
+                <div className="flex items-center gap-2 mb-1">
+                  <Zap className="w-4 h-4 text-amber-500" />
+                  <span className="text-xs font-black uppercase tracking-widest text-white">MT5 Signal Automation</span>
+                </div>
+                <p className="text-[11px] text-neutral-500 mb-4 leading-relaxed">
+                  The server evaluates a gold signal at each 15-minute candle close and acts per this mode —
+                  replacing the manual TradingView webhook. Applies when the active venue is MT5.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {([
+                    { val: 'off', label: 'Off', desc: 'No server signals. TradingView webhook only.', accent: 'neutral' },
+                    { val: 'approve', label: 'Approve to fire', desc: 'Signals appear on the dashboard; you click Fire.', accent: 'sky' },
+                    { val: 'auto', label: 'Autonomous', desc: 'Fires straight to the bridge. Hands-off.', accent: 'red' },
+                  ] as const).map(opt => {
+                    const active = (settings.mt5AutoMode || 'off') === opt.val;
+                    const ring = opt.accent === 'red' ? 'border-red-500 bg-red-500/10' : opt.accent === 'sky' ? 'border-sky-500 bg-sky-500/10' : 'border-neutral-300 bg-neutral-100/5';
+                    return (
+                      <button
+                        key={opt.val}
+                        type="button"
+                        onClick={() => setSettings({ ...settings, mt5AutoMode: opt.val })}
+                        className={'text-left p-3 border transition-all cursor-pointer ' +
+                          (active ? ring : 'border-neutral-800 bg-neutral-900 hover:border-neutral-700')}
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className={'w-2 h-2 rounded-full ' + (active ? (opt.accent === 'red' ? 'bg-red-500' : opt.accent === 'sky' ? 'bg-sky-400' : 'bg-neutral-200') : 'bg-neutral-700')}></span>
+                          <span className="text-[11px] font-black uppercase tracking-wider text-white">{opt.label}</span>
+                        </div>
+                        <span className="text-[10px] text-neutral-500 leading-snug block">{opt.desc}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {settings.mt5AutoMode !== 'off' && (
+                  <div className="mt-4 pt-4 border-t border-neutral-800 flex items-center gap-3 flex-wrap">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-neutral-400">Evaluation timeframe</span>
+                    <div className="inline-flex border border-neutral-700">
+                      {[1, 3, 5, 15, 30].map(m => {
+                        const active = (settings.signalCandleMinutes || 5) === m;
+                        return (
+                          <button
+                            key={m}
+                            type="button"
+                            onClick={() => setSettings({ ...settings, signalCandleMinutes: m })}
+                            className={'px-3 py-1.5 text-[10px] font-black uppercase border-none cursor-pointer transition-all ' +
+                              (active ? 'bg-neutral-100 text-neutral-950' : 'bg-neutral-900 text-neutral-400 hover:bg-neutral-800')}
+                          >
+                            {m}m
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <span className="text-[9px] font-mono text-neutral-600">Signal evaluated once per {settings.signalCandleMinutes || 5}-minute candle close.</span>
+                  </div>
+                )}
+                {settings.mt5AutoMode === 'auto' && (
+                  <p className="text-[10px] text-red-400 mt-3 font-mono">
+                    ⚠ Autonomous mode opens trades with no confirmation. On a funded account, a bad run can breach
+                    the daily-loss rule. The kill switch and risk gates still apply.
+                  </p>
+                )}
               </div>
 
               {/* CONTROL ACTIONS FOR FORM */}
@@ -3175,6 +3467,99 @@ if __name__ == '__main__':
               <p className="text-sm text-neutral-400 leading-relaxed max-w-3xl font-sans">
                 A granular audit trail of all liquidated positions with precise tracking of entry/exit executions, trade duration, and final realized profit and loss (PnL).
               </p>
+            </div>
+
+            {/* P&L CALENDAR */}
+            {(() => {
+              const cal = buildPnLCalendar(calMonth, closedTrades);
+              const monthLabel = calMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+              const cells: (number | null)[] = [
+                ...Array(cal.firstWeekday).fill(null),
+                ...Array.from({ length: cal.daysInMonth }, (_, i) => i + 1),
+              ];
+              const shift = (delta: number) => setCalMonth(new Date(cal.year, cal.mon + delta, 1));
+              return (
+                <div className="border border-neutral-800 bg-neutral-900/40 p-5">
+                  <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs font-black uppercase tracking-widest text-neutral-300">P&amp;L Calendar</span>
+                      <span className={'text-xs font-black font-mono ' + (cal.monthPnl > 0 ? 'text-green-400' : cal.monthPnl < 0 ? 'text-red-400' : 'text-neutral-500')}>
+                        {cal.monthPnl >= 0 ? '+' : ''}${cal.monthPnl.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button type="button" onClick={() => shift(-1)} className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-[10px] font-black border-none cursor-pointer">‹</button>
+                      <span className="text-[11px] font-mono text-neutral-400 min-w-[120px] text-center">{monthLabel}</span>
+                      <button type="button" onClick={() => shift(1)} className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-[10px] font-black border-none cursor-pointer">›</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-7 gap-1">
+                    {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, i) => (
+                      <div key={'h' + i} className="text-[9px] font-black text-neutral-600 uppercase text-center pb-1">{d}</div>
+                    ))}
+                    {cells.map((day, i) => {
+                      if (day === null) return <div key={'e' + i}></div>;
+                      const entry = cal.byDay[day];
+                      const pnl = entry?.pnl ?? 0;
+                      const bg = !entry ? 'bg-neutral-900/40 border-neutral-800' :
+                        pnl > 0 ? 'bg-green-500/15 border-green-500/30' :
+                        pnl < 0 ? 'bg-red-500/15 border-red-500/30' : 'bg-neutral-800 border-neutral-700';
+                      return (
+                        <div key={'d' + i} className={'border p-1.5 min-h-[52px] flex flex-col justify-between ' + bg} title={entry ? `${entry.count} trade(s)` : 'No trades'}>
+                          <span className="text-[9px] font-mono text-neutral-500">{day}</span>
+                          {entry && (
+                            <span className={'text-[10px] font-black font-mono leading-none ' + (pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-neutral-400')}>
+                              {pnl >= 0 ? '+' : ''}{pnl.toFixed(0)}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="flex items-center gap-4 mt-3 text-[9px] font-mono text-neutral-600">
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 bg-green-500/40 inline-block"></span> profit day</span>
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 bg-red-500/40 inline-block"></span> loss day</span>
+                    <span>values are realized USD P&amp;L per day</span>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* AI TRADE REVIEW */}
+            <div className="border border-neutral-800 bg-neutral-900/40 p-5">
+              <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                <div className="flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-amber-500" />
+                  <span className="text-xs font-black uppercase tracking-widest text-white">AI Trade Review</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleGenerateReview}
+                  disabled={reviewLoading || closedTrades.length === 0}
+                  className="bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-neutral-950 font-black text-[10px] uppercase tracking-widest px-4 py-2 border-none cursor-pointer flex items-center gap-2"
+                >
+                  {reviewLoading ? (<><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Analysing…</>) : 'Generate review'}
+                </button>
+              </div>
+              {closedTrades.length === 0 ? (
+                <p className="text-[11px] font-mono text-neutral-500">Review becomes available once trades have closed.</p>
+              ) : !review ? (
+                <p className="text-[11px] font-mono text-neutral-500">Analyses your real closed trades — what's working, what's losing, and concrete changes to try.</p>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {review.stats && (
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] font-mono">
+                      <div className="bg-neutral-900 border border-neutral-800 p-2"><span className="text-[9px] text-neutral-500 uppercase block">Win rate</span><span className="text-neutral-200 font-bold">{review.stats.winRate.toFixed(0)}%</span></div>
+                      <div className="bg-neutral-900 border border-neutral-800 p-2"><span className="text-[9px] text-neutral-500 uppercase block">Profit factor</span><span className="text-neutral-200 font-bold">{review.stats.profitFactor.toFixed(2)}</span></div>
+                      <div className="bg-neutral-900 border border-neutral-800 p-2"><span className="text-[9px] text-neutral-500 uppercase block">Net P&amp;L</span><span className={(review.stats.netPnl >= 0 ? 'text-green-400' : 'text-red-400') + ' font-bold'}>${review.stats.netPnl.toFixed(2)}</span></div>
+                      <div className="bg-neutral-900 border border-neutral-800 p-2"><span className="text-[9px] text-neutral-500 uppercase block">Long / Short win</span><span className="text-neutral-200 font-bold">{review.stats.buy.winRate.toFixed(0)}% / {review.stats.sell.winRate.toFixed(0)}%</span></div>
+                    </div>
+                  )}
+                  <div className="bg-neutral-950 border border-neutral-800 p-3 text-[12px] text-neutral-300 leading-relaxed whitespace-pre-wrap font-sans">
+                    {review.report}
+                  </div>
+                </div>
+              )}
             </div>
 
             {closedTrades.length === 0 ? (
@@ -3270,6 +3655,101 @@ if __name__ == '__main__':
                 <span className="text-emerald-500 font-bold">PHASE 1: BACKTEST FIRST (LOCAL)</span>
                 <span>Ensure strategy expectancy is positive after commissions before paper/demo.</span>
               </div>
+            </div>
+
+            {/* PARAMETER OPTIMIZER */}
+            <div className="border border-neutral-800 bg-neutral-900/40 p-5 mb-2">
+              <div className="flex items-center gap-2 mb-1">
+                <Sliders className="w-4 h-4 text-amber-500" />
+                <span className="text-xs font-black uppercase tracking-widest text-white">Parameter Optimizer</span>
+              </div>
+              <p className="text-[11px] text-neutral-500 mb-4 leading-relaxed max-w-3xl">
+                Sweeps ranges of the selected parameters through the real-data backtester and ranks every combination.
+                This finds settings that actually performed on history — the basis for adjusting the strategy to the market instead of guessing.
+              </p>
+
+              <div className="flex flex-wrap gap-2 mb-3">
+                {Object.entries(OPTIMIZER_RANGES).map(([key, cfg]) => {
+                  const on = optSweeps.includes(key);
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setOptSweeps(on ? optSweeps.filter(k => k !== key) : [...optSweeps, key])}
+                      className={'px-3 py-1.5 text-[10px] font-black uppercase tracking-wider border transition-all cursor-pointer ' +
+                        (on ? 'bg-amber-500 text-neutral-950 border-amber-500' : 'bg-neutral-900 text-neutral-400 border-neutral-700 hover:border-neutral-500')}
+                      title={cfg.values.join(', ')}
+                    >
+                      {cfg.label} ({cfg.values.length})
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex items-center gap-3 flex-wrap mb-4">
+                <span className="text-[10px] font-black uppercase tracking-wider text-neutral-400">Rank by</span>
+                <select
+                  value={optRankBy}
+                  onChange={(e: any) => setOptRankBy(e.target.value)}
+                  className="bg-neutral-900 border border-neutral-700 text-neutral-200 text-[11px] font-mono px-2 py-1.5 outline-none"
+                >
+                  <option value="expectancyR">Expectancy (R)</option>
+                  <option value="expectancy">Expectancy ($)</option>
+                  <option value="profitFactor">Profit factor</option>
+                  <option value="winRate">Win rate</option>
+                  <option value="netPnl">Net P&amp;L</option>
+                </select>
+                <span className="text-[10px] font-mono text-neutral-600">{optComboCount} combination{optComboCount === 1 ? '' : 's'}{optComboCount > 60 ? ' (capped at 60)' : ''}</span>
+                <button
+                  type="button"
+                  onClick={handleOptimize}
+                  disabled={optLoading}
+                  className="ml-auto bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-neutral-950 font-black text-[10px] uppercase tracking-widest px-5 py-2 border-none cursor-pointer flex items-center gap-2"
+                >
+                  {optLoading ? (<><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Running…</>) : 'Run optimizer'}
+                </button>
+              </div>
+
+              {optResults && (
+                optResults.length === 0 ? (
+                  <div className="text-[11px] font-mono text-neutral-500 border border-neutral-800 p-3">
+                    No configuration produced enough trades to rank{optMeta ? ` (ran ${optMeta.ran})` : ''}. Widen the ranges or the date window.
+                  </div>
+                ) : (
+                  <div className="border border-neutral-800 overflow-x-auto">
+                    <table className="w-full text-left text-[11px] font-mono">
+                      <thead>
+                        <tr className="bg-neutral-900 text-neutral-500 text-[9px] uppercase">
+                          <th className="p-2">#</th>
+                          {optSweeps.map(k => <th key={k} className="p-2">{OPTIMIZER_RANGES[k].label}</th>)}
+                          <th className="p-2 text-right">Trades</th>
+                          <th className="p-2 text-right">Win%</th>
+                          <th className="p-2 text-right">PF</th>
+                          <th className="p-2 text-right">Exp (R)</th>
+                          <th className="p-2 text-right">Net $</th>
+                          <th className="p-2"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {optResults.slice(0, 10).map((r, i) => (
+                          <tr key={i} className={'border-t border-neutral-800 ' + (i === 0 ? 'bg-amber-500/5' : '')}>
+                            <td className="p-2 text-neutral-500">{i + 1}{i === 0 ? ' ★' : ''}</td>
+                            {optSweeps.map(k => <td key={k} className="p-2 text-neutral-200">{r.sweptValues[k]}</td>)}
+                            <td className="p-2 text-right text-neutral-300">{r.metrics.totalTrades}</td>
+                            <td className="p-2 text-right text-neutral-300">{r.metrics.winRate.toFixed(0)}%</td>
+                            <td className="p-2 text-right text-neutral-300">{r.metrics.profitFactor.toFixed(2)}</td>
+                            <td className={'p-2 text-right font-bold ' + (r.metrics.expectancyR >= 0 ? 'text-green-400' : 'text-red-400')}>{r.metrics.expectancyR.toFixed(3)}</td>
+                            <td className={'p-2 text-right font-bold ' + (r.metrics.netPnl >= 0 ? 'text-green-400' : 'text-red-400')}>{r.metrics.netPnl.toFixed(0)}</td>
+                            <td className="p-2">
+                              <button type="button" onClick={() => applyOptimizedParams(r.sweptValues)} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-[9px] font-black uppercase px-2 py-1 border-none cursor-pointer">Apply</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              )}
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">

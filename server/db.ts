@@ -94,6 +94,18 @@ export interface TradingSettings {
   // Which MT5 credential profile the venue switch targets. Distinguishes the two mt5
   // positions ("MT5 Demo" vs "Funded") without changing the routing itself.
   mt5AccountType: 'demo' | 'funded';
+  // Server-side signal automation for MT5, replacing the manual TradingView webhook.
+  //   off     — no server signals (TradingView webhook only)
+  //   approve — signals surface on the dashboard for one-click firing
+  //   auto    — signals fire straight to the bridge, hands-off
+  mt5AutoMode: 'off' | 'approve' | 'auto';
+  // Candle interval (minutes) the signal engine evaluates on. Bybit-supported values only.
+  signalCandleMinutes: number;
+  // Intraday equity circuit breaker: auto-flatten + kill switch when equity draws down
+  // past maxDrawdownPercent from the day's starting equity. Protects a funded eval from
+  // open-position losses, which the entry-only daily-loss veto does not cover.
+  isCircuitBreakerActive: boolean;
+  maxDrawdownPercent: number;
   mt5Host: string;
   mt5Login: string;
   mt5Password: string;
@@ -135,6 +147,17 @@ export interface ClosedTrade {
   routerReason?: string;
 }
 
+export interface PendingSignal {
+  id: string;
+  createdAt: number;
+  side: 'buy' | 'sell';
+  symbol: string;
+  price: number;
+  quantity: number;
+  reason: string;          // why the engine produced this signal
+  status: 'pending' | 'fired' | 'dismissed' | 'expired';
+}
+
 export interface DbSchema {
   settings: TradingSettings;
   logs: WebhookLog[];
@@ -144,6 +167,7 @@ export interface DbSchema {
   };
   trades: ClosedTrade[];
   mt5Accounts: MT5Account[];
+  pendingSignals?: PendingSignal[];
 }
 
 const DB_DIR = path.join(process.cwd(), 'data');
@@ -214,6 +238,10 @@ const defaultDb: DbSchema = {
     },
     activeBroker: 'bybit',
     mt5AccountType: 'demo',
+    mt5AutoMode: 'off',
+    signalCandleMinutes: 5,
+    isCircuitBreakerActive: false,
+    maxDrawdownPercent: 5,
     mt5Host: 'http://localhost:5000',
     mt5Login: '',
     mt5Password: '',
@@ -560,6 +588,52 @@ export class Database {
     const db = this.get();
     db.logs = [];
     this.save(db);
+  }
+
+  // --- Pending signals (server-side automation) ---------------------------
+  public static getPendingSignals(): PendingSignal[] {
+    const db = this.get();
+    return (db.pendingSignals || []).filter(s => s.status === 'pending');
+  }
+
+  public static addPendingSignal(sig: Omit<PendingSignal, 'id' | 'createdAt' | 'status'>): PendingSignal {
+    const db = this.get();
+    if (!db.pendingSignals) db.pendingSignals = [];
+    const newSig: PendingSignal = {
+      ...sig,
+      id: 'sig-' + Math.random().toString(36).slice(2, 11),
+      createdAt: Date.now(),
+      status: 'pending',
+    };
+    db.pendingSignals.unshift(newSig);
+    // Keep the list bounded.
+    db.pendingSignals = db.pendingSignals.slice(0, 50);
+    this.save(db);
+    return newSig;
+  }
+
+  public static setPendingSignalStatus(id: string, status: PendingSignal['status']): PendingSignal | null {
+    const db = this.get();
+    const sig = (db.pendingSignals || []).find(s => s.id === id);
+    if (!sig) return null;
+    sig.status = status;
+    this.save(db);
+    return sig;
+  }
+
+  // Expire pending signals older than the given age so stale entries are never fired.
+  public static expirePendingSignals(maxAgeMs: number): void {
+    const db = this.get();
+    if (!db.pendingSignals || db.pendingSignals.length === 0) return;
+    const now = Date.now();
+    let changed = false;
+    for (const s of db.pendingSignals) {
+      if (s.status === 'pending' && now - s.createdAt > maxAgeMs) {
+        s.status = 'expired';
+        changed = true;
+      }
+    }
+    if (changed) this.save(db);
   }
 
   public static getPaperAccount() {

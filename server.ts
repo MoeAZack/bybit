@@ -11,6 +11,8 @@ import { RegimeRouter } from './server/router.js';
 import { BasketManager } from './server/basketManager.js';
 import { GoogleGenAI } from '@google/genai';
 import { registerMt5BridgeRoutes, enqueueMt5Command, getBridgeStatus } from './server/mt5bridge.js';
+import { runSignalEngine, executeMt5Signal, checkCircuitBreaker } from './server/signalEngine.js';
+import { optimize } from './server/optimizer.js';
 import { QuantDataManager } from './server/quantData.js';
 import { StrategyRouter } from './server/strategyRouter.js';
 import { QuantRiskManager } from './server/quantRisk.js';
@@ -232,6 +234,10 @@ app.post('/api/settings', (req, res) => {
       // MT5 fields
       activeBroker,
       mt5AccountType,
+      mt5AutoMode,
+      signalCandleMinutes,
+      isCircuitBreakerActive,
+      maxDrawdownPercent,
       mt5Host,
       mt5Login,
       mt5Password,
@@ -266,6 +272,10 @@ app.post('/api/settings', (req, res) => {
       // MT5 fields
       activeBroker: activeBroker !== undefined ? activeBroker : db.settings.activeBroker,
       mt5AccountType: mt5AccountType !== undefined ? mt5AccountType : db.settings.mt5AccountType,
+      mt5AutoMode: mt5AutoMode !== undefined ? mt5AutoMode : (db.settings.mt5AutoMode || 'off'),
+      signalCandleMinutes: signalCandleMinutes !== undefined ? Number(signalCandleMinutes) : (db.settings.signalCandleMinutes || 5),
+      isCircuitBreakerActive: isCircuitBreakerActive !== undefined ? Boolean(isCircuitBreakerActive) : (db.settings.isCircuitBreakerActive || false),
+      maxDrawdownPercent: maxDrawdownPercent !== undefined ? Number(maxDrawdownPercent) : (db.settings.maxDrawdownPercent || 5),
       mt5Host: mt5Host !== undefined ? mt5Host : db.settings.mt5Host,
       mt5Login: mt5Login !== undefined ? mt5Login : db.settings.mt5Login,
       mt5Server: mt5Server !== undefined ? mt5Server : db.settings.mt5Server,
@@ -327,6 +337,49 @@ app.post('/api/settings', (req, res) => {
 app.post('/api/logs/clear', (req, res) => {
   try {
     Database.clearLogs();
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Pending signals (server-side automation, approve mode) ---
+app.get('/api/signals', (_req, res) => {
+  try {
+    res.json(Database.getPendingSignals());
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/signals/:id/approve', async (req, res) => {
+  try {
+    const db = Database.get();
+    const sig = (db.pendingSignals || []).find(s => s.id === req.params.id && s.status === 'pending');
+    if (!sig) return res.status(404).json({ error: 'Signal not found or already handled.' });
+
+    const result = await executeMt5Signal({
+      side: sig.side,
+      symbol: sig.symbol,
+      price: sig.price,
+      quantity: sig.quantity,
+      settings: db.settings,
+      reason: sig.reason,
+      source: 'approved',
+    });
+    // Keep it pending on a blocked fire (e.g. disarmed) so it can be retried.
+    Database.setPendingSignalStatus(sig.id, result.fired ? 'fired' : 'pending');
+    if (result.fired) return res.json({ success: true, message: result.message });
+    return res.status(400).json({ error: result.message });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/signals/:id/dismiss', (req, res) => {
+  try {
+    const sig = Database.setPendingSignalStatus(req.params.id, 'dismissed');
+    if (!sig) return res.status(404).json({ error: 'Signal not found.' });
     res.json({ success: true });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
@@ -691,6 +744,111 @@ app.post('/api/backtest', async (req, res) => {
     });
 
     res.json(result);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6b. Parameter optimizer — sweep a grid through the backtester and rank the results.
+app.post('/api/optimize', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const base: any = {
+      fastEma: Number(b.fastEma || 12),
+      slowEma: Number(b.slowEma || 26),
+      rsiPeriod: Number(b.rsiPeriod || 14),
+      rsiOverbought: Number(b.rsiOverbought || 70),
+      rsiOversold: Number(b.rsiOversold || 30),
+      atrPeriod: Number(b.atrPeriod || 14),
+      atrMultiplierSL: Number(b.atrMultiplierSL || 1.5),
+      atrMultiplierTP: Number(b.atrMultiplierTP || 3.0),
+      feePercent: Number(b.feePercent !== undefined ? b.feePercent : 0.055),
+      slippageTicks: Number(b.slippageTicks !== undefined ? b.slippageTicks : 1),
+      walkForward: b.walkForward || 'none',
+      isRegimeFilterActive: Boolean(b.isRegimeFilterActive),
+      adxThreshold: b.adxThreshold !== undefined ? Number(b.adxThreshold) : 22,
+      isVolatilitySizingActive: Boolean(b.isVolatilitySizingActive),
+      riskPercent: b.riskPercent !== undefined ? Number(b.riskPercent) : 1.0,
+      orderType: b.orderType || 'MARKET',
+      isTimeStopActive: Boolean(b.isTimeStopActive),
+      timeStopBars: b.timeStopBars !== undefined ? Number(b.timeStopBars) : 20,
+      symbol: 'XAUUSDT',
+      backtestModule: b.backtestModule || 'trend',
+    };
+
+    // sweeps: { paramName: number[] }. rankBy: metric. maxCombos capped server-side.
+    const sweeps: Record<string, number[]> = b.sweeps && typeof b.sweeps === 'object' ? b.sweeps : {};
+    const rankBy = b.rankBy || 'expectancyR';
+    const maxCombos = Math.min(Number(b.maxCombos || 40), 60);
+
+    if (Object.keys(sweeps).length === 0) {
+      return res.status(400).json({ error: 'No parameter ranges provided to sweep.' });
+    }
+
+    const out = await optimize(base, sweeps, rankBy, maxCombos);
+    res.json({ ...out, rankBy });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6d. Trade review — compute real stats from closed trades, then have Gemini analyse them.
+app.post('/api/trades/review', async (req, res) => {
+  try {
+    const db = Database.get();
+    const trades = db.trades || [];
+    if (trades.length === 0) {
+      return res.json({ stats: null, report: 'No closed trades to review yet.' });
+    }
+
+    const wins = trades.filter(t => t.pnl > 0);
+    const losses = trades.filter(t => t.pnl <= 0);
+    const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
+    const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+    const bySide = (side: 'buy' | 'sell') => {
+      const g = trades.filter(t => t.side === side);
+      const w = g.filter(t => t.pnl > 0).length;
+      return { count: g.length, winRate: g.length ? (w / g.length) * 100 : 0, pnl: g.reduce((s, t) => s + t.pnl, 0) };
+    };
+    const byModule = (mod: 'trend' | 'range') => {
+      const g = trades.filter(t => t.module === mod);
+      const w = g.filter(t => t.pnl > 0).length;
+      return { count: g.length, winRate: g.length ? (w / g.length) * 100 : 0, pnl: g.reduce((s, t) => s + t.pnl, 0) };
+    };
+    const sorted = [...trades].sort((a, b) => b.pnl - a.pnl);
+
+    const stats = {
+      total: trades.length,
+      winRate: (wins.length / trades.length) * 100,
+      grossProfit, grossLoss,
+      profitFactor: grossLoss > 0 ? grossProfit / grossLoss : grossProfit,
+      avgWin: wins.length ? grossProfit / wins.length : 0,
+      avgLoss: losses.length ? grossLoss / losses.length : 0,
+      netPnl: trades.reduce((s, t) => s + t.pnl, 0),
+      buy: bySide('buy'), sell: bySide('sell'),
+      trend: byModule('trend'), range: byModule('range'),
+      best: sorted[0] ? { pnl: sorted[0].pnl, side: sorted[0].side } : null,
+      worst: sorted[sorted.length - 1] ? { pnl: sorted[sorted.length - 1].pnl, side: sorted[sorted.length - 1].side } : null,
+    };
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      return res.json({ stats, report: 'AI review needs a GEMINI_API_KEY configured. Stats above are computed from your real closed trades.' });
+    }
+
+    const prompt = `You are a trading performance analyst reviewing a gold (XAUUSD) algo's closed trades.
+Here are the real statistics:
+- Total trades: ${stats.total}, win rate: ${stats.winRate.toFixed(1)}%, net P&L: $${stats.netPnl.toFixed(2)}
+- Profit factor: ${stats.profitFactor.toFixed(2)}, avg win: $${stats.avgWin.toFixed(2)}, avg loss: $${stats.avgLoss.toFixed(2)}
+- Long trades: ${stats.buy.count} (win ${stats.buy.winRate.toFixed(0)}%, P&L $${stats.buy.pnl.toFixed(2)})
+- Short trades: ${stats.sell.count} (win ${stats.sell.winRate.toFixed(0)}%, P&L $${stats.sell.pnl.toFixed(2)})
+- Trend module: ${stats.trend.count} trades (win ${stats.trend.winRate.toFixed(0)}%), Range module: ${stats.range.count} trades (win ${stats.range.winRate.toFixed(0)}%)
+
+Write a concise review (max 180 words): what is working, what is losing money, and 2-3 concrete, specific parameter or rule changes to try next. Be direct and quantitative. Do not invent data beyond what is given.`;
+
+    const response = await ai.models.generateContent({ model: 'gemini-3.5-flash', contents: prompt });
+    const report = (response as any).text || 'No analysis returned.';
+    res.json({ stats, report });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
@@ -1583,6 +1741,39 @@ async function startServer() {
         console.error('[BasketManager Poll] Error in background monitor loop:', e.message || e);
       }
     }, 10000);
+
+    // --- MT5 SIGNAL AUTOMATION LOOP -----------------------------------------
+    // Independent of the basket loop above (which only runs when a basket is active).
+    // Evaluates once per confirmed candle, on the interval set by signalCandleMinutes,
+    // and dispatches per settings.mt5AutoMode. Polls every 20s so a new candle is picked
+    // up promptly for any supported interval.
+    const BYBIT_INTERVALS = new Set([1, 3, 5, 15, 30, 60]);
+    let sigLastCandleTime = 0;
+    setInterval(async () => {
+      try {
+        // Circuit breaker runs every tick regardless of automation mode.
+        await checkCircuitBreaker();
+
+        const s = Database.get().settings;
+        if (s.activeBroker !== 'mt5' || (s.mt5AutoMode || 'off') === 'off') return;
+
+        const minutes = BYBIT_INTERVALS.has(Number(s.signalCandleMinutes)) ? Number(s.signalCandleMinutes) : 5;
+        const period = minutes * 60 * 1000;
+        const candleTime = Math.floor(Date.now() / period) * period;
+        if (sigLastCandleTime === 0) { sigLastCandleTime = candleTime; return; }
+        if (candleTime <= sigLastCandleTime) return;
+        sigLastCandleTime = candleTime;
+
+        // Public market data — Bybit klines need no keys, and gold prices track the terminal.
+        const client = new BybitClient({ apiKey: '', apiSecret: '', environment: 'live' });
+        const klines = await client.getKlines({ symbol: 'XAUUSDT', interval: String(minutes), limit: 50 });
+        if (klines && klines.length >= 30) {
+          await runSignalEngine(klines, s, candleTime, minutes);
+        }
+      } catch (e: any) {
+        console.error('[SignalEngine Loop] Error:', e.message || e);
+      }
+    }, 20000);
   });
 }
 
