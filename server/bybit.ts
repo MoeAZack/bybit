@@ -130,6 +130,44 @@ export class BybitClient {
   }
 
   /**
+   * Fetch klines across an arbitrary date range by paginating backwards (Bybit caps a
+   * single call at 1000). Returns candles within [startMs, endMs], de-duplicated and
+   * sorted chronologically ascending. Used by the backtester so it can test real months
+   * of history and honour walk-forward windows, instead of only the last ~1000 candles.
+   */
+  public async getKlinesRange(params: {
+    symbol: string;
+    interval: string;
+    startMs: number;
+    endMs: number;
+    maxCandles?: number;
+  }): Promise<any[]> {
+    const seen = new Map<number, any>();
+    const cap = params.maxCandles || 20000;
+    let end = params.endMs;
+
+    for (let i = 0; i < 40; i++) {
+      const batch = await this.getKlines({
+        symbol: params.symbol,
+        interval: params.interval,
+        limit: 1000,
+        start: params.startMs,
+        end,
+      });
+      if (!batch || batch.length === 0) break;
+      for (const k of batch) seen.set(Number(k[0]), k);
+
+      const oldestTs = Math.min(...batch.map((k: any) => Number(k[0])));
+      if (oldestTs <= params.startMs || batch.length < 1000 || seen.size >= cap) break;
+      end = oldestTs - 1; // step the window further back
+    }
+
+    return Array.from(seen.values())
+      .filter(k => Number(k[0]) >= params.startMs && Number(k[0]) <= params.endMs)
+      .sort((a, b) => Number(a[0]) - Number(b[0]));
+  }
+
+  /**
    * Modify Position Stop Loss and Take Profit
    */
   public async setTradingStop(params: {

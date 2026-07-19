@@ -272,14 +272,18 @@ export class Backtester {
     try {
       const client = new BybitClient({ apiKey: '', apiSecret: '' });
       const symbol = params.symbol || 'XAUUSDT';
-      const rawKlines = await client.getKlines({
+      // Fetch the actual walk-forward window (paginated), not just the last 1000 candles.
+      const rawKlines = await client.getKlinesRange({
         symbol,
         interval: '15',
-        limit: 1000,
+        startMs: startDate.getTime(),
+        endMs: endDate.getTime(),
+        maxCandles: 20000,
       });
 
       if (rawKlines && rawKlines.length > 28) {
-        const chronologicalKlines = [...rawKlines].reverse();
+        // getKlinesRange already returns chronological ascending order.
+        const chronologicalKlines = rawKlines;
         const highs = chronologicalKlines.map(k => parseFloat(k[2]));
         const lows = chronologicalKlines.map(k => parseFloat(k[3]));
         const closes = chronologicalKlines.map(k => parseFloat(k[4]));

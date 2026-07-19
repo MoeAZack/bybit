@@ -1596,7 +1596,20 @@ export default function App() {
                   <div className="border border-dashed border-neutral-800 p-8 text-center text-neutral-600 rounded-none bg-neutral-900/10">
                     <TrendingUp className="w-8 h-8 text-neutral-700 mx-auto mb-2" />
                     <p className="text-sm font-bold uppercase tracking-wider text-neutral-500">No active positions</p>
-                    <p className="text-xs text-neutral-600 mt-1">Waiting for TradingView trigger webhook...</p>
+                    {settings.activeBroker === 'mt5' && settings.mt5AutoMode !== 'off' ? (
+                      <>
+                        <p className="text-xs text-neutral-600 mt-1">
+                          Signal automation {settings.mt5AutoMode === 'auto' ? 'AUTONOMOUS' : 'APPROVE'} — evaluating every {settings.signalCandleMinutes || 5}m candle close.
+                        </p>
+                        {!bridgeMetrics.connected ? (
+                          <p className="text-[11px] text-red-400 mt-1 font-mono">Bridge offline — no execution until it reconnects.</p>
+                        ) : (
+                          <p className="text-[11px] text-amber-500 mt-1 font-mono">Arm the bridge on the MT5 chart to allow execution.</p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-neutral-600 mt-1">Waiting for TradingView trigger webhook...</p>
+                    )}
                   </div>
                 ) : (
                   <div className="space-y-4">
