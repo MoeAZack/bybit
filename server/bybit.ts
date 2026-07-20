@@ -7,6 +7,27 @@ export interface BybitConfig {
   isTestnet?: boolean;
 }
 
+/**
+ * Bybit's kline endpoint returns raw arrays [startTime, open, high, low, close, volume, ...]
+ * in newest-first order. Indicator code (evaluateSignal, basket manager) expects objects
+ * with .time/.open/.high/.low/.close/.volume in chronological order. This converts between
+ * them. Passing raw arrays to that code silently yields NaN for every field.
+ */
+export function normalizeKlines(raw: any[]): Array<{ time: Date; open: number; high: number; low: number; close: number; volume: number }> {
+  if (!Array.isArray(raw)) return [];
+  return [...raw]
+    .map((k: any) => ({
+      time: new Date(Number(k[0])),
+      open: Number(k[1]),
+      high: Number(k[2]),
+      low: Number(k[3]),
+      close: Number(k[4]),
+      volume: Number(k[5] || 0),
+    }))
+    .filter(k => Number.isFinite(k.close) && Number.isFinite(k.high) && Number.isFinite(k.low))
+    .sort((a, b) => a.time.getTime() - b.time.getTime());
+}
+
 export class BybitClient {
   private apiKey: string;
   private apiSecret: string;

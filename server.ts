@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { Database } from './server/db.js';
-import { BybitClient } from './server/bybit.js';
+import { BybitClient, normalizeKlines } from './server/bybit.js';
 import { MT5Client } from './server/mt5.js';
 import { Backtester } from './server/backtester.js';
 import { CentralRiskManager } from './server/risk.js';
@@ -1173,7 +1173,7 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           environment: settings.bybitEnvironment,
         });
         const mappedSymbol = symbol === 'XAUUSD' ? 'XAUUSDT' : symbol;
-        const klines = await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 });
+        const klines = normalizeKlines(await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 }));
         if (klines && klines.length >= 30) {
           const highs = klines.map((k: any) => k.high);
           const lows = klines.map((k: any) => k.low);
@@ -1220,7 +1220,7 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           environment: settings.bybitEnvironment,
         });
         const mappedSymbol = symbol === 'XAUUSD' ? 'XAUUSDT' : symbol;
-        const klines = await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 });
+        const klines = normalizeKlines(await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 }));
 
         if (action === 'buy' || action === 'sell') {
           const triggerResult = await BasketManager.checkGatesAndTrigger(klines, settings);
@@ -1728,12 +1728,12 @@ async function startServer() {
             environment: currentSettings.bybitEnvironment,
           });
 
-          const klines = await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 });
+          const klines = normalizeKlines(await client.getKlines({ symbol: mappedSymbol, interval: '15', limit: 50 }));
           if (klines && klines.length >= 30) {
             const closes = klines.map((k: any) => k.close);
             const highs = klines.map((k: any) => k.high);
             const lows = klines.map((k: any) => k.low);
-            const volumes = klines.map((k: any) => k.volume || k.vol || 1);
+            const volumes = klines.map((k: any) => k.volume || 1);
             await BasketManager.handleConfirmedCandle(closes, highs, lows, volumes, currentSettings);
           }
         }
@@ -1766,8 +1766,10 @@ async function startServer() {
 
         // Public market data — Bybit klines need no keys, and gold prices track the terminal.
         const client = new BybitClient({ apiKey: '', apiSecret: '', environment: 'live' });
-        const klines = await client.getKlines({ symbol: 'XAUUSDT', interval: String(minutes), limit: 50 });
-        if (klines && klines.length >= 30) {
+        const raw = await client.getKlines({ symbol: 'XAUUSDT', interval: String(minutes), limit: 50 });
+        // getKlines returns raw arrays newest-first; evaluateSignal needs objects, chronological.
+        const klines = normalizeKlines(raw);
+        if (klines.length >= 30) {
           await runSignalEngine(klines, s, candleTime, minutes);
         }
       } catch (e: any) {
