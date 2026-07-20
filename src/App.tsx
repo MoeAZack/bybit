@@ -1685,6 +1685,52 @@ export default function App() {
                 )}
               </div>
 
+              {/* APPLIED TRADE SETTINGS — what actually gets sent on a trade */}
+              <div className="border border-neutral-800 bg-neutral-900/40 p-4">
+                <h3 className="text-xs font-black text-neutral-300 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                  <Sliders className="w-3.5 h-3.5 text-amber-500" /> Applied Trade Settings
+                </h3>
+                {(() => {
+                  const dynamicStops = settings.isHybridStopsActive;
+                  const rows: { label: string; value: string; kind: 'FIXED' | 'VARIABLE' }[] = [
+                    { label: 'Position size', value: `${settings.defaultOrderSize} lot`, kind: 'VARIABLE' },
+                    { label: 'Leverage', value: `${settings.defaultLeverage}x`, kind: 'FIXED' },
+                    { label: 'Stop loss', value: dynamicStops ? 'Dynamic (ATR)' : `${settings.stopLossPercent}% fixed`, kind: dynamicStops ? 'VARIABLE' : 'FIXED' },
+                    { label: 'Take profit', value: dynamicStops ? 'Dynamic (ATR)' : `${settings.takeProfitPercent}% fixed`, kind: dynamicStops ? 'VARIABLE' : 'FIXED' },
+                    { label: 'Signal timeframe', value: `${settings.signalCandleMinutes || 5}m candle`, kind: 'FIXED' },
+                  ];
+                  return (
+                    <div className="flex flex-col gap-1.5 text-[11px] font-mono">
+                      {rows.map(r => (
+                        <div key={r.label} className="flex items-center justify-between gap-2">
+                          <span className="text-neutral-500">{r.label}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-neutral-200 font-bold">{r.value}</span>
+                            <span className={'text-[8px] font-black px-1 py-0.5 border ' + (r.kind === 'VARIABLE' ? 'text-sky-400 border-sky-500/30 bg-sky-500/5' : 'text-neutral-500 border-neutral-700')}>{r.kind}</span>
+                          </div>
+                        </div>
+                      ))}
+                      <div className="border-t border-neutral-800 mt-1.5 pt-1.5 flex flex-wrap gap-1.5">
+                        {[
+                          { on: settings.isKillSwitchActive, label: 'KILL SWITCH', danger: true },
+                          { on: settings.isCircuitBreakerActive, label: `BREAKER ${settings.maxDrawdownPercent}%` },
+                          { on: settings.isCentralRiskVetoActive, label: 'RISK VETO' },
+                          { on: settings.isSessionFilterActive, label: 'SESSION FILTER' },
+                        ].map(g => (
+                          <span key={g.label} className={'text-[8px] font-black px-1.5 py-0.5 border tracking-wider ' +
+                            (g.on ? (g.danger ? 'bg-red-500/15 text-red-400 border-red-500/30' : 'bg-green-500/10 text-green-400 border-green-500/30') : 'bg-neutral-900 text-neutral-600 border-neutral-800')}>
+                            {g.label} {g.on ? 'ON' : 'OFF'}
+                          </span>
+                        ))}
+                      </div>
+                      <p className="text-[9px] text-neutral-600 mt-1.5 leading-snug">
+                        Base size is fixed but the risk manager auto-reduces it after loss streaks — hence VARIABLE. Stops are ATR-dynamic when hybrid stops are on.
+                      </p>
+                    </div>
+                  );
+                })()}
+              </div>
+
               {/* SIMULATION TESTING SUITE IN PANEL */}
               <div className="mt-auto border border-amber-500/10 bg-amber-500/5 p-4 rounded-none">
                 <h3 className="text-xs font-black text-amber-500 uppercase tracking-widest mb-2 flex items-center gap-1">

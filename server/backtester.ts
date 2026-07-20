@@ -3,6 +3,22 @@ import { BybitClient } from './bybit.js';
 import { calculateBollingerBands, calculateSessionVWAP } from './indicators.js';
 import { isWithinTier1Blackout } from './newsCalendar.js';
 
+// Raw-kline cache. A single backtest fetches months of history (~40 paginated calls); an
+// optimizer sweep runs dozens of backtests over the SAME window, so without caching it
+// re-fetches identical data every time. Keyed by symbol+interval+window, short TTL because
+// only the most recent candle changes within a window.
+const _klineCache = new Map<string, { at: number; klines: any[] }>();
+const KLINE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function fetchKlinesCached(client: BybitClient, symbol: string, interval: string, startMs: number, endMs: number): Promise<any[]> {
+  const key = `${symbol}:${interval}:${startMs}:${endMs}`;
+  const hit = _klineCache.get(key);
+  if (hit && Date.now() - hit.at < KLINE_CACHE_TTL_MS) return hit.klines;
+  const klines = await client.getKlinesRange({ symbol, interval, startMs, endMs, maxCandles: 20000 });
+  _klineCache.set(key, { at: Date.now(), klines });
+  return klines;
+}
+
 function calculateEMA(prices: number[], period: number): number[] {
   const ema: number[] = [];
   if (prices.length === 0) return ema;
@@ -272,14 +288,8 @@ export class Backtester {
     try {
       const client = new BybitClient({ apiKey: '', apiSecret: '' });
       const symbol = params.symbol || 'XAUUSDT';
-      // Fetch the actual walk-forward window (paginated), not just the last 1000 candles.
-      const rawKlines = await client.getKlinesRange({
-        symbol,
-        interval: '15',
-        startMs: startDate.getTime(),
-        endMs: endDate.getTime(),
-        maxCandles: 20000,
-      });
+      // Fetch the actual walk-forward window (paginated), cached so sweeps reuse the data.
+      const rawKlines = await fetchKlinesCached(client, symbol, '15', startDate.getTime(), endDate.getTime());
 
       if (rawKlines && rawKlines.length > 28) {
         // getKlinesRange already returns chronological ascending order.
