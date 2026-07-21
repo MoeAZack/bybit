@@ -366,6 +366,7 @@ app.post('/api/signals/:id/approve', async (req, res) => {
       settings: db.settings,
       reason: sig.reason,
       source: 'approved',
+      atr: sig.atr,
     });
     // Keep it pending on a blocked fire (e.g. disarmed) so it can be retried.
     Database.setPendingSignalStatus(sig.id, result.fired ? 'fired' : 'pending');
@@ -585,13 +586,9 @@ app.get('/api/positions', async (req, res) => {
       }
     }
 
-    // Update paper positions dynamically for Trailing Stop, SL and TP
-    CentralRiskManager.updatePaperPositions(db, currentGoldPrice);
-
-    // Update live positions trailing and breakeven stops
-    if (!db.settings.isPaperTrading) {
-      await CentralRiskManager.updateLivePositions(db, currentGoldPrice);
-    }
+    // Position management (SL/TP triggers, trailing, breakeven) runs in the background
+    // management loop in startServer so it works headless — not only while this endpoint
+    // is polled. The handler just reports the latest managed state.
 
     const result: any = {
       paperAccount: db.paperAccount,
@@ -1776,6 +1773,27 @@ async function startServer() {
         console.error('[SignalEngine Loop] Error:', e.message || e);
       }
     }, 20000);
+
+    // --- POSITION MANAGEMENT LOOP -------------------------------------------
+    // Trailing stops, breakeven moves, and paper SL/TP triggers, run headless every 12s so
+    // they work when no browser is open. Uses the terminal's live gold price when available.
+    setInterval(async () => {
+      try {
+        const db = Database.get();
+        const bridge = getBridgeStatus();
+        const livePrice = bridge.connected && bridge.price && bridge.price > 0
+          ? bridge.price
+          : (global as any).lastFetchedGoldPrice;
+        if (!livePrice || livePrice <= 0) return; // never fabricate a price
+
+        CentralRiskManager.updatePaperPositions(db, livePrice);
+        if (!db.settings.isPaperTrading && db.settings.activeBroker === 'mt5') {
+          await CentralRiskManager.updateLivePositions(db, livePrice);
+        }
+      } catch (e: any) {
+        console.error('[PositionManagement Loop] Error:', e.message || e);
+      }
+    }, 12000);
   });
 }
 

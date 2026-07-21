@@ -192,15 +192,21 @@ export class CentralRiskManager {
       };
     }
 
-    // Dynamic volatility ATR sizing
-    let atr = payloadAtr || 12.5; // realistic XAUUSD ATR
-    if (!payloadAtr) {
-      if (activeModule === 'trend') {
-        atr = 15.8; // higher volatility during trends
-      } else if (activeModule === 'range') {
-        atr = 6.4; // lower volatility sideways
-      }
+    // Dynamic volatility ATR sizing. Fail closed: if we have no real ATR, use the honest
+    // static-percent stops instead of fabricating a volatility number.
+    const hasRealAtr = typeof payloadAtr === 'number' && Number.isFinite(payloadAtr) && payloadAtr > 0;
+    if (!hasRealAtr) {
+      const slPercent = settings.stopLossPercent;
+      const tpPercent = settings.takeProfitPercent;
+      const slDist = price * (slPercent / 100);
+      const tpDist = price * (tpPercent / 100);
+      return {
+        stopLossPrice: side === 'buy' ? Number((price - slDist).toFixed(2)) : Number((price + slDist).toFixed(2)),
+        takeProfitPrice: side === 'buy' ? Number((price + tpDist).toFixed(2)) : Number((price - tpDist).toFixed(2)),
+        reason: `Dynamic stops requested but no real ATR available — fell back to static [SL: ${slPercent}%, TP: ${tpPercent}%].`,
+      };
     }
+    const atr = payloadAtr as number;
 
     const slDistance = atr * settings.atrMultiplier;
     // Calculate TP maintaining the proportional Risk-to-Reward Ratio configured

@@ -155,6 +155,7 @@ export interface PendingSignal {
   price: number;
   quantity: number;
   reason: string;          // why the engine produced this signal
+  atr?: number;            // real ATR at signal time, for dynamic stops on approval
   status: 'pending' | 'fired' | 'dismissed' | 'expired';
 }
 

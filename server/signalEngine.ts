@@ -10,6 +10,12 @@ import { Database, TradingSettings } from './db.js';
 import { BasketManager } from './basketManager.js';
 import { CentralRiskManager } from './risk.js';
 import { enqueueMt5Command, getBridgeStatus } from './mt5bridge.js';
+import { calculateATR } from './indicators.js';
+
+// Guards against opening a second position before the heartbeat reflects the first one
+// (heartbeat lags ~20s). Combined with the open-positions check, enforces one at a time.
+let lastFireAt = 0;
+const FIRE_LOCK_MS = 45 * 1000;
 
 // Debounce: remember the last fired side and candle so we do not re-enter the same
 // direction on every confirmed bar. Cooldown scales with the candle interval (a few bars).
@@ -84,8 +90,9 @@ export async function executeMt5Signal(opts: {
   settings: TradingSettings;
   reason: string;
   source: 'auto' | 'approved';
+  atr?: number;
 }): Promise<ExecuteResult> {
-  const { side, symbol, price, quantity, settings, reason, source } = opts;
+  const { side, symbol, price, quantity, settings, reason, source, atr } = opts;
   const mode = settings.isPaperTrading ? 'paper' : 'live';
 
   const block = (message: string): ExecuteResult => {
@@ -110,12 +117,22 @@ export async function executeMt5Signal(opts: {
   if (!bridge.connected) return block('MT5 bridge is not connected (no recent heartbeat)');
   if (!bridge.armed) return block('MT5 bridge is DISARMED on the terminal');
 
-  // Gate 3: central risk veto (daily loss, exposure, etc.).
+  // Gate 3: no stacking. One position at a time — refuse if the terminal already has one,
+  // and hold a short local lock so a slow heartbeat can't let two fire back-to-back.
+  if (bridge.positions && bridge.positions.length > 0) {
+    return block(`a position is already open (${bridge.positions.length}) — not stacking`);
+  }
+  if (Date.now() - lastFireAt < FIRE_LOCK_MS) {
+    return block('an order was just queued — waiting for the terminal to confirm before another');
+  }
+
+  // Gate 4: central risk veto (daily loss, exposure, etc.).
   const risk = await CentralRiskManager.evaluateTradeRisk({ symbol, side, quantity, price, settings });
   if (!risk.allowed) return block(risk.reason || 'central risk manager vetoed the trade');
   const finalQty = risk.modifiedQuantity !== undefined ? risk.modifiedQuantity : quantity;
 
-  // Stops, matching the webhook path.
+  // Stops, matching the webhook path. Real ATR (when supplied) drives dynamic stops;
+  // without it calculateDynamicStops falls back to honest static-percent stops.
   let sl: number | undefined;
   let tp: number | undefined;
   if (settings.isHybridStopsActive) {
@@ -123,6 +140,7 @@ export async function executeMt5Signal(opts: {
       price,
       side,
       settings,
+      payloadAtr: atr,
       activeModule: settings.activeRegimeModule === 'range' ? 'range' : 'trend',
     });
     sl = stops.stopLossPrice;
@@ -139,6 +157,7 @@ export async function executeMt5Signal(opts: {
     comment: `moeby ${source}`,
   });
 
+  lastFireAt = Date.now();
   Database.addLog({
     rawBody: { source, side, symbol, price, quantity: finalQty, reason },
     status: 'success',
@@ -151,6 +170,17 @@ export async function executeMt5Signal(opts: {
   });
 
   return { fired: true, message: `Queued ${cmd.action} ${finalQty} ${symbol}` };
+}
+
+// Real ATR(14) from the evaluation klines, for volatility-adaptive stops.
+function atrFromKlines(klines: any[]): number | undefined {
+  if (!klines || klines.length < 15) return undefined;
+  const highs = klines.map(k => Number(k.high));
+  const lows = klines.map(k => Number(k.low));
+  const closes = klines.map(k => Number(k.close));
+  const arr = calculateATR(highs, lows, closes, 14);
+  const last = arr[arr.length - 1];
+  return Number.isFinite(last) && last > 0 ? last : undefined;
 }
 
 /**
@@ -179,13 +209,14 @@ export async function runSignalEngine(klines: any[], settings: TradingSettings, 
   const price = Number(klines[klines.length - 1].close);
   const symbol = 'XAUUSD';
   const quantity = settings.defaultOrderSize || 0.1;
+  const atr = atrFromKlines(klines);
   const reason = `${signal} from live ${candleMinutes}m evaluation (RSI / %B / VWAP, ADX-gated)`;
 
   if (autoMode === 'approve') {
     // Surface for one-click firing; avoid stacking duplicates of the same side.
     const dup = Database.getPendingSignals().some(s => s.side === side);
     if (!dup) {
-      Database.addPendingSignal({ side, symbol, price, quantity, reason });
+      Database.addPendingSignal({ side, symbol, price, quantity, reason, atr });
       console.log(`[SignalEngine] Pending ${side} signal created for approval at ${price}`);
     }
     lastSide = side;
@@ -194,7 +225,7 @@ export async function runSignalEngine(klines: any[], settings: TradingSettings, 
   }
 
   // autoMode === 'auto'
-  const result = await executeMt5Signal({ side, symbol, price, quantity, settings, reason, source: 'auto' });
+  const result = await executeMt5Signal({ side, symbol, price, quantity, settings, reason, source: 'auto', atr });
   console.log(`[SignalEngine] auto ${side} @ ${price}: ${result.fired ? 'FIRED' : 'blocked'} — ${result.message}`);
   if (result.fired) {
     lastSide = side;
