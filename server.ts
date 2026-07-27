@@ -11,7 +11,7 @@ import { RegimeRouter } from './server/router.js';
 import { BasketManager } from './server/basketManager.js';
 import { GoogleGenAI } from '@google/genai';
 import { registerMt5BridgeRoutes, enqueueMt5Command, getBridgeStatus } from './server/mt5bridge.js';
-import { runSignalEngine, executeMt5Signal, checkCircuitBreaker } from './server/signalEngine.js';
+import { runSignalEngine, executeSignal, checkCircuitBreaker, resolveAutoMode } from './server/signalEngine.js';
 import { optimize } from './server/optimizer.js';
 import { QuantDataManager } from './server/quantData.js';
 import { StrategyRouter } from './server/strategyRouter.js';
@@ -358,7 +358,7 @@ app.post('/api/signals/:id/approve', async (req, res) => {
     const sig = (db.pendingSignals || []).find(s => s.id === req.params.id && s.status === 'pending');
     if (!sig) return res.status(404).json({ error: 'Signal not found or already handled.' });
 
-    const result = await executeMt5Signal({
+    const result = await executeSignal({
       side: sig.side,
       symbol: sig.symbol,
       price: sig.price,
@@ -1476,6 +1476,23 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           // Calculate stops for exchange placement
           let slString: string | undefined = undefined;
           let tpString: string | undefined = undefined;
+          let bybitStopsReason = 'Hybrid stops disabled — no SL/TP attached.';
+
+          // Stops go through the SAME central risk manager the MT5 path uses, so Bybit gets
+          // volatility-adaptive ATR stops instead of naive fixed percentages. Falls back to
+          // honest static-percent stops when no real ATR is available (never fabricated).
+          if (settings.isHybridStopsActive && (action === 'buy' || action === 'sell')) {
+            const stops = CentralRiskManager.calculateDynamicStops({
+              price,
+              side: action,
+              settings,
+              payloadAtr: payload.atr ? Number(payload.atr) : undefined,
+              activeModule,
+            });
+            slString = stops.stopLossPrice.toFixed(2);
+            tpString = stops.takeProfitPrice.toFixed(2);
+            bybitStopsReason = stops.reason;
+          }
 
           // Compute idempotent client order ID using prefix and hash
           const prefix = settings.clientOrderIdPrefix || 'TF-';
@@ -1483,11 +1500,6 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           const orderLinkId = prefix + crypto.createHash('md5').update(idToHash).digest('hex').substring(0, 16);
 
           if (action === 'buy') {
-            if (settings.isHybridStopsActive) {
-              slString = (price * (1 - settings.stopLossPercent / 100)).toFixed(2);
-              tpString = (price * (1 + settings.takeProfitPercent / 100)).toFixed(2);
-            }
-
             orderResult = await client.placeOrder({
               symbol,
               side: 'Buy',
@@ -1497,13 +1509,8 @@ app.post('/api/tradingview-webhook', async (req, res) => {
               takeProfit: tpString,
               orderLinkId,
             });
-            execMessage = `Bybit order created: Market BUY of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}, ClientID: ${orderLinkId}) ${riskReason}`;
+            execMessage = `Bybit order created: Market BUY of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. ${bybitStopsReason} (Order ID: ${orderResult.orderId}, ClientID: ${orderLinkId}) ${riskReason}`;
           } else if (action === 'sell') {
-            if (settings.isHybridStopsActive) {
-              slString = (price * (1 + settings.stopLossPercent / 100)).toFixed(2);
-              tpString = (price * (1 - settings.takeProfitPercent / 100)).toFixed(2);
-            }
-
             orderResult = await client.placeOrder({
               symbol,
               side: 'Sell',
@@ -1513,7 +1520,7 @@ app.post('/api/tradingview-webhook', async (req, res) => {
               takeProfit: tpString,
               orderLinkId,
             });
-            execMessage = `Bybit order created: Market SELL of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. (Order ID: ${orderResult.orderId}, ClientID: ${orderLinkId}) ${riskReason}`;
+            execMessage = `Bybit order created: Market SELL of ${finalQuantity} ${symbol}. Module: ${activeModule.toUpperCase()}. Stops on server: [SL: ${slString || 'None'}, TP: ${tpString || 'None'}]. ${bybitStopsReason} (Order ID: ${orderResult.orderId}, ClientID: ${orderLinkId}) ${riskReason}`;
           } else if (action === 'close') {
             // Close: get active position and reverse it
             const positions = await client.getPositions(symbol);
@@ -1752,7 +1759,8 @@ async function startServer() {
         await checkCircuitBreaker();
 
         const s = Database.get().settings;
-        if (s.activeBroker !== 'mt5' || (s.mt5AutoMode || 'off') === 'off') return;
+        // Venue-agnostic: runs for Bybit (primary) and MT5 (prop firms) alike.
+        if (resolveAutoMode(s) === 'off') return;
 
         const minutes = BYBIT_INTERVALS.has(Number(s.signalCandleMinutes)) ? Number(s.signalCandleMinutes) : 5;
         const period = minutes * 60 * 1000;
@@ -1787,7 +1795,8 @@ async function startServer() {
         if (!livePrice || livePrice <= 0) return; // never fabricate a price
 
         CentralRiskManager.updatePaperPositions(db, livePrice);
-        if (!db.settings.isPaperTrading && db.settings.activeBroker === 'mt5') {
+        // Trailing stops / breakeven for live positions on whichever venue is active.
+        if (!db.settings.isPaperTrading) {
           await CentralRiskManager.updateLivePositions(db, livePrice);
         }
       } catch (e: any) {

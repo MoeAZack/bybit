@@ -171,8 +171,21 @@ export interface DbSchema {
   pendingSignals?: PendingSignal[];
 }
 
-const DB_DIR = path.join(process.cwd(), 'data');
+// Storage location. Override with DATA_DIR to point at a mounted persistent volume
+// (e.g. a GCS FUSE mount or attached disk) instead of the container's ephemeral layer.
+const DB_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
+
+// Loud warning when running on Cloud Run (or any container) without persistent storage:
+// the container filesystem is wiped on every redeploy, scale-to-zero, and instance
+// recycle, silently taking settings, API keys, paper state and trade history with it.
+if (!process.env.DATA_DIR && (process.env.K_SERVICE || process.env.CLOUD_RUN_JOB)) {
+  console.warn(
+    '[DB] WARNING: running on Cloud Run with EPHEMERAL storage. ' +
+    `State at ${DB_FILE} will be LOST on redeploy, scale-to-zero, or instance recycle. ` +
+    'Set DATA_DIR to a mounted persistent volume, and run with --min-instances=1.'
+  );
+}
 
 export function getContractMultiplier(symbol: string): number {
   if (!symbol) return 1;
