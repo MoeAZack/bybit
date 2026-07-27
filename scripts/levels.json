@@ -1,0 +1,11 @@
+{
+  "symbol": "TVC:GOLD",
+  "bias": "LONG",
+  "setAt": "2026-07-27",
+  "setPrice": 4091,
+  "stop": 4068,
+  "stopWide": 4038,
+  "reentries": { "A": 4072, "B": 4054 },
+  "targets": { "TP1": 4104, "TP2": 4117, "TP3": 4166 },
+  "note": "Personal account, single stop. Structural (1H/4H/1D swings) + ATR buffer. Scalp-tilted."
+}
