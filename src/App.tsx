@@ -1579,7 +1579,14 @@ export default function App() {
                     </div>
                     <div>
                       <span className="text-neutral-500">BROKER:</span> <span className="text-neutral-200">
-                        {settings.activeBroker === 'mt5' ? `MT5: ${settings.mt5Server}` : (settings.isTestnet ? 'Bybit Testnet' : 'Bybit Live')}
+                        {/* Label from bybitEnvironment — the field that actually selects the
+                            API host. The old label read the unrelated isTestnet flag, so it
+                            could show "Bybit Testnet" while orders went to the LIVE endpoint. */}
+                        {settings.activeBroker === 'mt5'
+                          ? `MT5: ${settings.mt5Server}`
+                          : settings.bybitEnvironment === 'live' ? 'Bybit LIVE — REAL MONEY'
+                          : settings.bybitEnvironment === 'testnet' ? 'Bybit Testnet'
+                          : 'Bybit Demo'}
                       </span>
                     </div>
                   </div>
