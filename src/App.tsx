@@ -797,31 +797,48 @@ export default function App() {
     }
   }, [activeTab]);
 
-  // Live gold price from the MT5 terminal via the bridge heartbeat.
-  // Per project rules, the price must be real market data -- no random walk. When the
-  // bridge has no fresh quote, the last known value is held and marked stale rather than
-  // invented.
+  // Live price for the ACTIVE venue.
+  //
+  // This used to read only /api/bridge/status — the MT5 EA heartbeat — so on Bybit the
+  // ticker panels sat on "AWAITING BRIDGE / $—.——" indefinitely even though the exchange
+  // price was available. /api/price serves whichever venue is active and returns null
+  // rather than a placeholder, so a missing quote shows as unknown instead of invented.
+  // Bridge metrics are still polled for MT5, where the EA latency/queue depth matter.
   useEffect(() => {
     let cancelled = false;
+    const isMt5 = settings.activeBroker === 'mt5';
+
     const poll = async () => {
       try {
         const t0 = performance.now();
-        const res = await fetch('/api/bridge/status');
+        const res = await fetch('/api/price');
         if (!res.ok || cancelled) return;
-        const s = await res.json();
+        const p = await res.json();
         const latencyMs = Math.round(performance.now() - t0);
-        setBridgeMetrics({
-          latencyMs,
-          bridgeAgeSec: s.lastHeartbeat ? Math.max(0, Math.round((Date.now() - s.lastHeartbeat) / 1000)) : null,
-          queueDepth: typeof s.queueDepth === 'number' ? s.queueDepth : null,
-          connected: !!s.connected,
-        });
 
-        const live = typeof s.price === 'number' && s.price > 0;
-        setPriceSource(live ? (s.priceSymbol || 'MT5') : null);
+        if (isMt5) {
+          try {
+            const bs = await fetch('/api/bridge/status');
+            if (bs.ok && !cancelled) {
+              const s = await bs.json();
+              setBridgeMetrics({
+                latencyMs,
+                bridgeAgeSec: s.lastHeartbeat ? Math.max(0, Math.round((Date.now() - s.lastHeartbeat) / 1000)) : null,
+                queueDepth: typeof s.queueDepth === 'number' ? s.queueDepth : null,
+                connected: !!s.connected,
+              });
+            }
+          } catch { /* metrics are best-effort */ }
+        } else {
+          // No EA on Bybit: report REST reachability so the panel is not stuck "awaiting".
+          setBridgeMetrics({ latencyMs, bridgeAgeSec: null, queueDepth: null, connected: !!p.connected });
+        }
+
+        const live = typeof p.price === 'number' && p.price > 0;
+        setPriceSource(live ? (p.symbol || p.source || null) : null);
         if (!live) return;
 
-        const newPrice = Number(s.price.toFixed(2));
+        const newPrice = Number(p.price.toFixed(2));
         setGoldPrice(prev => {
           if (newPrice > prev) { setPriceChange('up'); setFlashKey(k => k + 1); }
           else if (newPrice < prev) { setPriceChange('down'); setFlashKey(k => k + 1); }
@@ -845,7 +862,7 @@ export default function App() {
     poll();
     const priceInterval = setInterval(poll, 1500);
     return () => { cancelled = true; clearInterval(priceInterval); };
-  }, []);
+  }, [settings.activeBroker]);
 
   const fetchWithRetry = async (url: string, options?: RequestInit, retries = 5, delay = 1000): Promise<Response> => {
     for (let i = 0; i < retries; i++) {
@@ -1969,7 +1986,9 @@ export default function App() {
                         {priceSource} LIVE
                       </span>
                     ) : (
-                      <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[9px] px-1.5 py-0.5 font-bold uppercase tracking-wider rounded">AWAITING BRIDGE</span>
+                      <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[9px] px-1.5 py-0.5 font-bold uppercase tracking-wider rounded">
+                        {settings.activeBroker === 'mt5' ? 'AWAITING BRIDGE' : 'AWAITING FEED'}
+                      </span>
                     )}
                   </div>
                   <h1 className="text-6xl md:text-7xl font-black tracking-tighter leading-none mt-2 font-mono">
@@ -2048,7 +2067,9 @@ export default function App() {
                   </svg>
                   
                   <div className="absolute bottom-4 left-4 bg-black/80 px-2 py-1 text-[10px] font-mono text-amber-500 border border-amber-500/20 tracking-wider">
-                    {priceSource ? `${priceSource} · LIVE FEED` : 'AWAITING BRIDGE'}
+                    {priceSource
+                      ? `${priceSource} · LIVE FEED`
+                      : settings.activeBroker === 'mt5' ? 'AWAITING BRIDGE' : 'AWAITING FEED'}
                   </div>
                 </div>
               </div>

@@ -521,13 +521,63 @@ app.post('/api/paper/reset', (req, res) => {
   }
 });
 
+/**
+ * Lightweight live price for the ACTIVE venue.
+ *
+ * The dashboard used to read its price solely from /api/bridge/status, i.e. the MT5 EA
+ * heartbeat. On Bybit no EA exists, so the ticker panels sat on "AWAITING BRIDGE / $—.——"
+ * forever even though the exchange price was available. This serves whichever venue is
+ * active, and returns price: null (never a placeholder) when there is no real quote.
+ */
+app.get('/api/price', async (_req, res) => {
+  try {
+    const db = Database.get();
+    const s = db.settings;
+
+    if (s.activeBroker === 'mt5') {
+      const bridge = getBridgeStatus();
+      const live = typeof bridge.price === 'number' && bridge.price > 0;
+      return res.json({
+        price: live ? Number(bridge.price.toFixed(2)) : null,
+        symbol: live ? (bridge.priceSymbol || 'XAUUSD') : null,
+        source: live ? 'MT5' : null,
+        connected: !!bridge.connected,
+      });
+    }
+
+    // Bybit: public ticker, no credentials required.
+    const symbol = s.defaultSymbol || 'XAUUSDT';
+    try {
+      const publicBybit = new BybitClient({ apiKey: '', apiSecret: '', environment: 'live' });
+      const tick = await publicBybit.getTicker(symbol);
+      const price = tick.lastPrice > 0 ? tick.lastPrice : tick.markPrice;
+      if (price > 0) {
+        (global as any).lastFetchedGoldPrice = price;
+        return res.json({ price: Number(price.toFixed(2)), symbol, source: 'BYBIT', connected: true });
+      }
+    } catch { /* fall through to last-known-real below */ }
+
+    const cached = (global as any).lastFetchedGoldPrice;
+    return res.json({
+      price: cached ? Number(Number(cached).toFixed(2)) : null,
+      symbol,
+      source: cached ? 'BYBIT (cached)' : null,
+      connected: false,
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 6. Get Account details & Open positions
 app.get('/api/positions', async (req, res) => {
   try {
     const db = Database.get();
     
-    // Simulating / Updating live mark prices for paper trading
-    let currentGoldPrice = 2375.50;
+    // Live mark price for marking paper/demo positions. 0 means "unknown" — it is
+    // reported as null rather than substituted, so nothing downstream marks a position
+    // against an invented price.
+    let currentGoldPrice = 0;
     if (db.settings.activeBroker === 'mt5') {
       if (db.settings.mt5Login && db.settings.mt5Password) {
         try {
@@ -578,10 +628,10 @@ app.get('/api/positions', async (req, res) => {
           (global as any).lastFetchedGoldPrice = currentGoldPrice;
         }
       } catch (e) {
+        // Fall back to the last REAL price we saw, never to a made-up one. If we have
+        // never had a real quote, currentGoldPrice stays 0 and is reported as null.
         if ((global as any).lastFetchedGoldPrice) {
           currentGoldPrice = (global as any).lastFetchedGoldPrice;
-        } else {
-          currentGoldPrice = 2375.50; // Dynamic random walk disabled for measurement honesty
         }
       }
     }
@@ -595,7 +645,7 @@ app.get('/api/positions', async (req, res) => {
       liveAccount: null,
       activeMode: db.settings.isPaperTrading ? 'paper' : 'live',
       trades: db.trades || [],
-      currentSimulatedPrice: Number(currentGoldPrice.toFixed(2)),
+      currentSimulatedPrice: currentGoldPrice > 0 ? Number(currentGoldPrice.toFixed(2)) : null,
     };
 
     // Fetch actual broker account details based on selection
