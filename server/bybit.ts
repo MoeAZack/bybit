@@ -262,11 +262,18 @@ export class BybitClient {
    */
   public async getPositions(symbol?: string): Promise<any[]> {
     try {
-      const params: Record<string, any> = {
-        category: 'linear',
-      };
+      // Bybit v5 /position/list requires one of symbol | baseCoin | settleCoin alongside
+      // category. Sending category alone fails with retCode 10001 ("Missing some
+      // parameters that must be filled in, symbol or settleCoin"), which broke every
+      // portfolio-wide query: the risk manager's exposure check, the emergency risk
+      // sweep, and the dashboard's position list. Those fail closed, so the effect was
+      // that every live Bybit entry got vetoed. Default to the USDT settle coin to fetch
+      // the whole linear book when no symbol is given.
+      const params: Record<string, any> = { category: 'linear' };
       if (symbol) {
         params.symbol = symbol;
+      } else {
+        params.settleCoin = 'USDT';
       }
 
       const result = await this.request('GET', '/v5/position/list', params);
