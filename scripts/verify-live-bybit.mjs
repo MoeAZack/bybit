@@ -67,17 +67,14 @@ if (pos.status !== 200) {
   bad(`/api/positions returned ${pos.status}`);
 } else if (p.liveAccountError) {
   bad(`exchange rejected the request: ${p.liveAccountError}`);
-} else if (typeof p.liveBalance === 'number' || typeof p.balance === 'number' || p.paperAccount) {
-  const bal = p.liveBalance ?? p.balance ?? p.paperAccount?.balance;
-  if (typeof p.liveBalance === 'number') {
-    ok(`wallet balance read from Bybit: ${p.liveBalance} ${p.currency || 'USDT'} — signing works`);
-  } else {
-    note(`no live balance field in response; simulator balance ${bal}. Raw keys: ${Object.keys(p).join(', ')}`);
-  }
+} else if (typeof p.liveAccount?.balance === 'number') {
+  ok(`wallet balance read from Bybit: ${p.liveAccount.balance} ${p.liveAccount.currency || 'USDT'} — HMAC signing works`);
+} else if (p.activeMode === 'paper') {
+  note(`paper mode: simulator balance ${p.paperAccount?.balance} (no exchange call made)`);
 } else {
-  note(`unexpected /api/positions shape. Keys: ${Object.keys(p).join(', ')}`);
+  note(`no liveAccount balance returned. Keys: ${Object.keys(p).join(', ')}`);
 }
-const open = (p.positions || p.livePositions || p.paperAccount?.positions || []).length;
+const open = (p.liveAccount?.positions || p.paperAccount?.positions || []).length;
 console.log(`        open positions: ${open}`);
 
 // ── 4. Trading readiness ──────────────────────────────────────────────────────

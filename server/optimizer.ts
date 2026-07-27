@@ -34,7 +34,8 @@ export interface OptimizeResult {
    * Anything above ~0.5 usually means the config was fitted to noise.
    */
   degradation?: number;
-  overfitRisk?: 'low' | 'medium' | 'high';
+  /** 'no-edge' = the config was already unprofitable in-sample, so there is nothing to overfit to. */
+  overfitRisk?: 'low' | 'medium' | 'high' | 'no-edge';
 }
 
 // Cartesian product of the swept parameter ranges, hard-capped so a runaway grid cannot
@@ -130,9 +131,20 @@ export async function optimize(
 
       const isScore = score(inSample, rankBy);
       const oosScore = score(outSample, rankBy);
-      const degradation = isScore > 0 ? (isScore - oosScore) / Math.abs(isScore) : (oosScore >= 0 ? 0 : 1);
-      const overfitRisk: OptimizeResult['overfitRisk'] =
-        degradation > 0.5 ? 'high' : degradation > 0.25 ? 'medium' : 'low';
+
+      // Degradation only means something when there was an in-sample edge to lose. If the
+      // config was already unprofitable in-sample there is nothing to overfit TO, so report
+      // 'no-edge' rather than a misleading "100% degradation / high overfit risk", which
+      // reads as if a real edge had decayed.
+      let degradation: number | undefined;
+      let overfitRisk: OptimizeResult['overfitRisk'];
+      if (isScore > 0) {
+        degradation = (isScore - oosScore) / Math.abs(isScore);
+        overfitRisk = degradation > 0.5 ? 'high' : degradation > 0.25 ? 'medium' : 'low';
+      } else {
+        degradation = undefined;
+        overfitRisk = 'no-edge';
+      }
 
       results.push({ params, sweptValues: swept, metrics: outSample, inSample, degradation, overfitRisk });
     } catch (e: any) {
