@@ -592,53 +592,22 @@ export class Database {
     };
   }
 
+  /**
+   * Reset the paper account to a clean slate.
+   *
+   * This previously RE-SEEDED three fabricated winning trades (entries at 2362.45 /
+   * 2374.20 / 2358.00, all profitable), so pressing "reset demo balance" installed a
+   * 100%-win-rate track record the bot had never earned, and every win-rate, expectancy
+   * and PnL figure downstream was computed from them. A reset must clear history, not
+   * invent it.
+   */
   public static resetPaperAccount(customBalance?: number): void {
     const db = this.get();
     db.paperAccount = {
       balance: customBalance || 10000,
       positions: [],
     };
-    db.trades = [
-      {
-        id: 'trade-1',
-        symbol: 'XAUUSDT',
-        side: 'buy',
-        entryPrice: 2362.45,
-        exitPrice: 2371.30,
-        quantity: 0.1,
-        leverage: 10,
-        entryTime: new Date(Date.now() - 4 * 3600000).toISOString(),
-        exitTime: new Date(Date.now() - 1 * 3600000).toISOString(),
-        pnl: 8.85,
-        durationMs: 3 * 3600000,
-      },
-      {
-        id: 'trade-2',
-        symbol: 'XAUUSDT',
-        side: 'sell',
-        entryPrice: 2374.20,
-        exitPrice: 2365.80,
-        quantity: 0.15,
-        leverage: 10,
-        entryTime: new Date(Date.now() - 8 * 3600000).toISOString(),
-        exitTime: new Date(Date.now() - 5 * 3600000).toISOString(),
-        pnl: 12.60,
-        durationMs: 3 * 3600000,
-      },
-      {
-        id: 'trade-3',
-        symbol: 'XAUUSDT',
-        side: 'buy',
-        entryPrice: 2358.00,
-        exitPrice: 2364.50,
-        quantity: 0.2,
-        leverage: 10,
-        entryTime: new Date(Date.now() - 12 * 3600000).toISOString(),
-        exitTime: new Date(Date.now() - 10 * 3600000).toISOString(),
-        pnl: 13.00,
-        durationMs: 2 * 3600000,
-      }
-    ];
+    db.trades = [];
     this.save(db);
   }
 }
