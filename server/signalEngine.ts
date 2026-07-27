@@ -432,6 +432,35 @@ export async function runSignalEngine(klines: any[], settings: TradingSettings, 
   const atr = atrFromKlines(klines);
   const reason = `${signal} from live ${candleMinutes}m evaluation (RSI / %B / VWAP, ADX-gated)`;
 
+  // SHADOW GATE. This must live here, in the path the autonomous loop actually runs.
+  // StrategyRouter has its own shadow check but nothing calls StrategyRouter.evaluateSignals,
+  // so gating only there would silently let a "shadowed" strategy keep trading.
+  //
+  // The live engine evaluates one strategy, labelled by activeRegimeModule. Shadowing it
+  // records every signal it would have taken — entry, stops, targets — without sending an
+  // order, so it accrues a genuine out-of-sample record on live data at zero risk.
+  const activeModule = settings.activeRegimeModule === 'range' ? 'range' : 'trend';
+  if ((settings.shadowModules || []).includes(activeModule)) {
+    const stops = CentralRiskManager.calculateDynamicStops({
+      price, side, settings, payloadAtr: atr,
+      activeModule: activeModule === 'range' ? 'range' : 'trend',
+    });
+    Database.addLog({
+      rawBody: { shadow: true, module: activeModule, side, symbol, price, quantity, atr, reason },
+      status: 'shadow',
+      action: side,
+      symbol,
+      price,
+      quantity,
+      message: `[SHADOW:${activeModule}] ${side.toUpperCase()} ${quantity} ${symbol} @ ${price} — recorded, NOT executed. SL ${stops.stopLossPrice} / TP ${stops.takeProfitPrice}. ${reason}`,
+      mode: settings.isPaperTrading ? 'paper' : 'live',
+    });
+    console.log(`[SignalEngine] SHADOW ${side} @ ${price} — logged, not executed`);
+    lastSide = side;
+    lastCandleTime = candleTime;
+    return;
+  }
+
   if (autoMode === 'approve') {
     // Surface for one-click firing; avoid stacking duplicates of the same side.
     const dup = Database.getPendingSignals().some(s => s.side === side);

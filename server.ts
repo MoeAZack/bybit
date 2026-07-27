@@ -231,6 +231,7 @@ app.post('/api/settings', (req, res) => {
       isCentralRiskVetoActive,
       maxPortfolioRiskPercent,
       activeRegimeModule,
+      shadowModules,
       // MT5 fields
       activeBroker,
       mt5AccountType,
@@ -269,6 +270,7 @@ app.post('/api/settings', (req, res) => {
       isCentralRiskVetoActive: isCentralRiskVetoActive !== undefined ? Boolean(isCentralRiskVetoActive) : db.settings.isCentralRiskVetoActive,
       maxPortfolioRiskPercent: maxPortfolioRiskPercent !== undefined ? Number(maxPortfolioRiskPercent) : db.settings.maxPortfolioRiskPercent,
       activeRegimeModule: activeRegimeModule !== undefined ? activeRegimeModule : db.settings.activeRegimeModule,
+      shadowModules: Array.isArray(shadowModules) ? shadowModules : (db.settings.shadowModules || []),
       // MT5 fields
       activeBroker: activeBroker !== undefined ? activeBroker : db.settings.activeBroker,
       mt5AccountType: mt5AccountType !== undefined ? mt5AccountType : db.settings.mt5AccountType,
