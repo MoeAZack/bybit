@@ -4396,11 +4396,12 @@ if __name__ == '__main__':
                 <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">DXY</div>
                 <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">DXY SPOT</span>
                 <span className="text-2xl font-black text-white block mt-1">
-                  {quantMetrics?.dxy?.toFixed(2) || '104.20'}
+                  {typeof quantMetrics?.dxy === 'number' ? quantMetrics.dxy.toFixed(2) : '—'}
                 </span>
-                <div className="flex items-center gap-1 text-[9px] text-red-400 mt-2">
-                  <span className="font-semibold">-0.12%</span>
-                  <span className="text-neutral-600">vs 24h ago</span>
+                <div className="flex items-center gap-1 text-[9px] mt-2">
+                  {typeof quantMetrics?.dxy === 'number'
+                    ? <span className="text-neutral-600">live feed</span>
+                    : <span className="text-amber-500 font-semibold">FEED UNAVAILABLE</span>}
                 </div>
               </div>
 
@@ -4409,11 +4410,12 @@ if __name__ == '__main__':
                 <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">US10Y</div>
                 <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">US 10Y YIELD</span>
                 <span className="text-2xl font-black text-amber-500 block mt-1">
-                  {quantMetrics?.yield10y ? `${quantMetrics.yield10y.toFixed(3)}%` : '4.150%'}
+                  {typeof quantMetrics?.yield10y === 'number' ? `${quantMetrics.yield10y.toFixed(3)}%` : '—'}
                 </span>
-                <div className="flex items-center gap-1 text-[9px] text-green-400 mt-2">
-                  <span className="font-semibold">+0.03%</span>
-                  <span className="text-neutral-600">Negative correlation</span>
+                <div className="flex items-center gap-1 text-[9px] mt-2">
+                  {typeof quantMetrics?.yield10y === 'number'
+                    ? <span className="text-neutral-600">Negative correlation to gold</span>
+                    : <span className="text-amber-500 font-semibold">FEED UNAVAILABLE</span>}
                 </div>
               </div>
 
@@ -4446,10 +4448,12 @@ if __name__ == '__main__':
                 <div className="absolute right-2 top-2 text-neutral-800 font-bold text-3xl select-none opacity-20">LIQ</div>
                 <span className="text-[9px] text-neutral-500 font-black uppercase tracking-wider block">BYBIT 24H LIQUIDATIONS</span>
                 <span className="text-2xl font-black text-rose-500 block mt-1">
-                  {quantMetrics?.liquidationsUsd ? `$${(quantMetrics.liquidationsUsd / 1000).toFixed(1)}K` : '$234.5K'}
+                  {typeof quantMetrics?.liquidationsUsd === 'number' ? `$${(quantMetrics.liquidationsUsd / 1000).toFixed(1)}K` : '—'}
                 </span>
-                <div className="text-[9px] text-rose-400 mt-2 font-bold animate-pulse">
-                  High volatility risk threshold
+                <div className="text-[9px] text-neutral-500 mt-2">
+                  {typeof quantMetrics?.liquidationsUsd === 'number'
+                    ? 'High volatility risk threshold'
+                    : 'No public liquidation feed — not reported'}
                 </div>
               </div>
             </div>
@@ -4477,15 +4481,18 @@ if __name__ == '__main__':
                   </div>
 
                   <div className="h-64 w-full relative">
+                    {/* Real macro series only. When the feed is down we show an explicit
+                        empty state instead of a hardcoded demo curve, which previously
+                        rendered stale ~$2,37x gold prices as if they were live. */}
+                    {!quantMetrics?.macroCharts?.length ? (
+                      <div className="h-full w-full flex flex-col items-center justify-center border border-dashed border-neutral-800 gap-1">
+                        <span className="text-xs font-black text-amber-500 uppercase tracking-wider">Macro feed unavailable</span>
+                        <span className="text-[10px] text-neutral-500 font-mono">DXY / US10Y could not be sourced — no data shown</span>
+                      </div>
+                    ) : (
                     <ResponsiveContainer width="100%" height="100%">
                       <AreaChart
-                        data={quantMetrics?.macroCharts || [
-                          { time: '11:00', dxy: 104.12, yield10y: 4.145, gold: 2372 },
-                          { time: '11:15', dxy: 104.15, yield10y: 4.148, gold: 2373 },
-                          { time: '11:30', dxy: 104.18, yield10y: 4.152, gold: 2374 },
-                          { time: '11:45', dxy: 104.22, yield10y: 4.150, gold: 2373 },
-                          { time: '12:00', dxy: 104.20, yield10y: 4.150, gold: 2375 }
-                        ]}
+                        data={quantMetrics.macroCharts}
                         margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
                       >
                         <defs>
@@ -4515,6 +4522,7 @@ if __name__ == '__main__':
                         <Area yAxisId="right" type="monotone" dataKey="yield10y" name="US10Y Yield" stroke="#6366f1" strokeWidth={1.5} fillOpacity={1} fill="url(#colorYield)" />
                       </AreaChart>
                     </ResponsiveContainer>
+                    )}
                   </div>
                 </div>
 

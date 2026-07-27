@@ -18,10 +18,10 @@ export class MetaLabeler {
     module: string;
     side: 'BUY' | 'SELL';
     adx: number;
-    fundingPercentile: number;
+    fundingPercentile: number | null;
     bandwidthPercentile: number;
-    dxy: number;
-    yield10y: number;
+    dxy: number | null;
+    yield10y: number | null;
     session: string;
   }): Promise<MetaLabelOutput> {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -68,10 +68,13 @@ Current Live Signal to Classify:
 - Action: ${params.side}
 - Session: ${params.session}
 - ADX (Volatility Trend Strength): ${params.adx.toFixed(1)}
-- Funding Percentile: ${params.fundingPercentile.toFixed(1)}%
+- Funding Percentile: ${params.fundingPercentile === null ? 'UNAVAILABLE' : params.fundingPercentile.toFixed(1) + '%'}
 - Volatility Bandwidth Percentile: ${params.bandwidthPercentile.toFixed(1)}%
-- US Dollar Index (DXY): ${params.dxy.toFixed(2)}
-- 10-Year Treasury Yield (TNX): ${params.yield10y.toFixed(2)}%
+- US Dollar Index (DXY): ${params.dxy === null ? 'UNAVAILABLE' : params.dxy.toFixed(2)}
+- 10-Year Treasury Yield (TNX): ${params.yield10y === null ? 'UNAVAILABLE' : params.yield10y.toFixed(2) + '%'}
+
+Any field marked UNAVAILABLE could not be sourced from a live feed. Do NOT assume a value
+for it and do NOT let it influence your reasoning; base the decision on the fields present.
 
 Predict if this setup matches a low-edge cluster ('SKIP') or a robust high-conviction edge cluster ('TAKE').`;
 
@@ -123,10 +126,10 @@ Predict if this setup matches a low-edge cluster ('SKIP') or a robust high-convi
     module: string;
     side: 'BUY' | 'SELL';
     adx: number;
-    fundingPercentile: number;
+    fundingPercentile: number | null;
     bandwidthPercentile: number;
-    dxy: number;
-    yield10y: number;
+    dxy: number | null;
+    yield10y: number | null;
     session: string;
   }): MetaLabelOutput {
     // Reversion under high ADX has severe edge decay -> Skip
@@ -147,8 +150,12 @@ Predict if this setup matches a low-edge cluster ('SKIP') or a robust high-convi
       };
     }
 
-    // High yields + strong dollar + Gold long -> Skip
-    if (params.side === 'BUY' && params.yield10y > 4.4 && params.dxy > 105.5) {
+    // High yields + strong dollar + Gold long -> Skip.
+    // Requires REAL macro readings. When the feed is down we cannot evaluate this gate;
+    // we say so explicitly and lower confidence rather than silently passing the trade
+    // (previously fabricated DXY/yield values made this check meaningless).
+    const macroAvailable = params.yield10y !== null && params.dxy !== null;
+    if (macroAvailable && params.side === 'BUY' && (params.yield10y as number) > 4.4 && (params.dxy as number) > 105.5) {
       return {
         prediction: 'SKIP',
         confidencePercent: 70,
@@ -158,8 +165,9 @@ Predict if this setup matches a low-edge cluster ('SKIP') or a robust high-convi
 
     return {
       prediction: 'TAKE',
-      confidencePercent: 82,
-      reason: `Regime conditions show robust edge alignment. Session: ${params.session.toUpperCase()}, Volatility: ADX(${params.adx.toFixed(0)}) standard.`,
+      confidencePercent: macroAvailable ? 82 : 65,
+      reason: `Regime conditions show robust edge alignment. Session: ${params.session.toUpperCase()}, Volatility: ADX(${params.adx.toFixed(0)}) standard.`
+        + (macroAvailable ? '' : ' NOTE: macro feed (DXY/10Y) unavailable — the macro veto could not be evaluated; confidence reduced accordingly.'),
     };
   }
 }

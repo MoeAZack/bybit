@@ -1,5 +1,6 @@
 import { Database, ClosedTrade, TradingSettings } from './db.js';
 import { QuantDataManager } from './quantData.js';
+import { getBridgeStatus } from './mt5bridge.js';
 import { calculateBollingerBands, calculateATR, calculateRSI } from './indicators.js';
 
 export interface SpecialistModule {
@@ -25,6 +26,30 @@ export interface RouterSignal {
 
 export class StrategyRouter {
   /**
+   * Dead-man switch. Returns true when new entries must be suppressed.
+   *
+   * Fails closed by design — every condition below is a reason NOT to trade:
+   *   - the operator has thrown the kill switch
+   *   - MT5 is the active venue but the EA bridge has no recent heartbeat / is disarmed
+   *   - Bybit is the active venue but no API credentials are configured
+   */
+  public static isDeadManTripped(settings: TradingSettings): boolean {
+    if (settings.isKillSwitchActive) return true;
+
+    if (settings.activeBroker === 'mt5') {
+      const bridge = getBridgeStatus();
+      if (!bridge.connected) return true;
+      if (!bridge.armed) return true;
+      return false;
+    }
+
+    // Bybit: REST venue, no heartbeat to lose — but we must hold credentials to reach it.
+    // Paper mode needs no keys (orders never leave the process).
+    if (!settings.isPaperTrading && (!settings.bybitApiKey || !settings.bybitApiSecret)) return true;
+    return false;
+  }
+
+  /**
    * Evaluates incoming candle data and decides which specialist module should trigger.
    * Enforces the deadband guard: no two conflicting modules fire on the same candle.
    */
@@ -46,8 +71,15 @@ export class StrategyRouter {
     // Read module parameters/toggles from db
     const modules = this.getModulesStatus();
 
-    // 2. CHECK DEAD-MAN SWITCH
-    const isDeadManActive = false; // Mock dead-man status checking. If MT5 bridge drops heartbeat, all entries blocked.
+    // 2. DEAD-MAN SWITCH — block all new entries when the operator has halted trading or
+    // the execution venue is not demonstrably healthy. Fails CLOSED: anything we cannot
+    // positively confirm counts as dead. (Previously hardcoded false and never read, which
+    // meant the switch did nothing at all.)
+    const isDeadManActive = this.isDeadManTripped(settings);
+    if (isDeadManActive) {
+      console.warn('[StrategyRouter] Dead-man switch active — suppressing all new entries.');
+      return null;
+    }
 
     // 3. SPECIALIST 1: Funding Extreme Fade
     const fundingFadeMod = modules.find(m => m.id === 'funding_fade');

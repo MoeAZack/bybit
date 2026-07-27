@@ -1,16 +1,34 @@
 /**
- * Server-side signal automation for MT5.
+ * Server-side signal automation. Venue-agnostic.
  *
  * Replaces the manual TradingView webhook: on each confirmed candle the engine runs the
  * same evaluateSignal() the rest of the system uses, then either queues the trade for
- * one-click approval on the dashboard, or fires it straight to the bridge -- controlled by
- * settings.mt5AutoMode. Both paths go through the same risk gates as the webhook.
+ * one-click approval on the dashboard, or fires it straight at the active venue --
+ * controlled by settings.autoMode (falling back to the legacy settings.mt5AutoMode).
+ *
+ * Two execution backends, selected by settings.activeBroker:
+ *   - 'bybit' -> executeBybitSignal(), REST orders straight to the exchange (primary)
+ *   - 'mt5'   -> executeMt5Signal(), queued to the MoebyBridge EA (kept for prop firms)
+ * Both enforce the identical gate sequence: kill switch -> venue health -> no-stacking ->
+ * fire lock -> central risk veto -> ATR stops.
  */
 import { Database, TradingSettings } from './db.js';
 import { BasketManager } from './basketManager.js';
 import { CentralRiskManager } from './risk.js';
 import { enqueueMt5Command, getBridgeStatus } from './mt5bridge.js';
+import { BybitClient } from './bybit.js';
 import { calculateATR } from './indicators.js';
+
+/** Resolve the automation mode, tolerating the legacy MT5-only setting name. */
+export function resolveAutoMode(s: TradingSettings): 'off' | 'approve' | 'auto' {
+  const raw = (s as any).autoMode || (s as any).mt5AutoMode || 'off';
+  return raw === 'approve' || raw === 'auto' ? raw : 'off';
+}
+
+/** Symbol the active venue expects for gold. */
+export function venueSymbol(s: TradingSettings): string {
+  return s.activeBroker === 'mt5' ? 'XAUUSD' : 'XAUUSDT';
+}
 
 // Guards against opening a second position before the heartbeat reflects the first one
 // (heartbeat lags ~20s). Combined with the open-positions check, enforces one at a time.
@@ -40,16 +58,41 @@ let cbTrippedToday = false;
 export async function checkCircuitBreaker() {
   const db = Database.get();
   const s = db.settings;
-  if (s.activeBroker !== 'mt5' || !s.isCircuitBreakerActive) return;
+  if (!s.isCircuitBreakerActive) return;
 
-  const bridge = getBridgeStatus();
-  if (!bridge.connected || bridge.equity == null || bridge.equity <= 0) return;
+  // Read equity from whichever venue is active. Bybit is the primary route; MT5 is kept
+  // for prop-firm accounts. If equity is unreadable we simply skip this tick (never guess).
+  let equity: number | null = null;
+  let lastPrice = 0;
+  let bybitClient: BybitClient | null = null;
+
+  if (s.activeBroker === 'mt5') {
+    const bridge = getBridgeStatus();
+    if (!bridge.connected || bridge.equity == null || bridge.equity <= 0) return;
+    equity = bridge.equity;
+    lastPrice = bridge.price ?? 0;
+  } else {
+    if (!s.bybitApiKey || !s.bybitApiSecret) return;
+    try {
+      bybitClient = new BybitClient({
+        apiKey: s.bybitApiKey,
+        apiSecret: s.bybitApiSecret,
+        environment: s.bybitEnvironment,
+      });
+      const wallet = await bybitClient.getWalletBalance();
+      if (!wallet || !Number.isFinite(wallet.balance) || wallet.balance <= 0) return;
+      equity = wallet.balance;
+    } catch {
+      return; // transient API failure — do not trip on missing data
+    }
+  }
+  if (equity == null || equity <= 0) return;
 
   const todayKey = new Date().toISOString().slice(0, 10);
   if (todayKey !== cbDayKey) {
     // New day: reset the high-water reference to the current equity.
     cbDayKey = todayKey;
-    cbDayStartEquity = bridge.equity;
+    cbDayStartEquity = equity;
     cbTrippedToday = false;
     return;
   }
@@ -57,25 +100,52 @@ export async function checkCircuitBreaker() {
 
   const dd = s.maxDrawdownPercent > 0 ? s.maxDrawdownPercent : 5;
   const floor = cbDayStartEquity * (1 - dd / 100);
-  if (bridge.equity > floor) return;
+  if (equity > floor) return;
 
   // Breach: flatten everything and halt new entries.
   cbTrippedToday = true;
-  enqueueMt5Command({ action: 'FLATTEN', symbol: 'XAUUSD', comment: 'circuit breaker' });
+  const symbol = venueSymbol(s);
+  let flattenNote = '';
+
+  if (s.activeBroker === 'mt5') {
+    enqueueMt5Command({ action: 'FLATTEN', symbol, comment: 'circuit breaker' });
+    flattenNote = 'Flatten command queued to the MT5 bridge.';
+  } else if (bybitClient) {
+    // Close every open position with reduce-only market orders.
+    try {
+      const positions = await bybitClient.getPositions(symbol);
+      const live = (positions || []).filter(p => Math.abs(Number(p.size || 0)) > 0);
+      for (const p of live) {
+        await bybitClient.placeOrder({
+          symbol: p.symbol || symbol,
+          side: String(p.side).toLowerCase() === 'buy' ? 'Sell' : 'Buy',
+          qty: String(Math.abs(Number(p.size))),
+          orderType: 'Market',
+          reduceOnly: true,
+          orderLinkId: `CB-${Date.now().toString(36)}`,
+        });
+      }
+      flattenNote = `Closed ${live.length} Bybit position(s) with reduce-only market orders.`;
+    } catch (e: any) {
+      flattenNote = `WARNING: failed to flatten Bybit positions (${e.message || e}) — kill switch still engaged, close manually.`;
+      console.error('[CircuitBreaker] Bybit flatten failed:', e);
+    }
+  }
+
   const updated = { ...s, isKillSwitchActive: true };
   Database.save({ ...db, settings: updated });
 
   Database.addLog({
-    rawBody: { equity: bridge.equity, dayStart: cbDayStartEquity, floor, drawdownPercent: dd },
+    rawBody: { equity, dayStart: cbDayStartEquity, floor, drawdownPercent: dd, venue: s.activeBroker },
     status: 'execution_failed',
     action: 'close',
-    symbol: 'XAUUSD',
-    price: bridge.price ?? 0,
+    symbol,
+    price: lastPrice,
     quantity: 0,
-    message: `[CircuitBreaker] TRIPPED — equity $${bridge.equity.toFixed(2)} breached the ${dd}% drawdown floor ($${floor.toFixed(2)} from $${cbDayStartEquity.toFixed(2)}). Flattened all positions and activated kill switch.`,
+    message: `[CircuitBreaker] TRIPPED — equity $${equity.toFixed(2)} breached the ${dd}% drawdown floor ($${floor.toFixed(2)} from $${cbDayStartEquity.toFixed(2)}). ${flattenNote} Kill switch activated.`,
     mode: s.isPaperTrading ? 'paper' : 'live',
   });
-  console.warn(`[CircuitBreaker] TRIPPED at equity ${bridge.equity} (floor ${floor.toFixed(2)})`);
+  console.warn(`[CircuitBreaker] TRIPPED at equity ${equity} (floor ${floor.toFixed(2)}) on ${s.activeBroker}`);
 }
 
 /**
@@ -172,6 +242,133 @@ export async function executeMt5Signal(opts: {
   return { fired: true, message: `Queued ${cmd.action} ${finalQty} ${symbol}` };
 }
 
+/**
+ * Execute a directional signal on Bybit, enforcing the same gates as the MT5 path.
+ * Primary execution route now that trading is personal-account (no prop firm).
+ */
+export async function executeBybitSignal(opts: {
+  side: 'buy' | 'sell';
+  symbol: string;
+  price: number;
+  quantity: number;
+  settings: TradingSettings;
+  reason: string;
+  source: 'auto' | 'approved';
+  atr?: number;
+}): Promise<ExecuteResult> {
+  const { side, symbol, price, quantity, settings, reason, source, atr } = opts;
+  const mode = settings.isPaperTrading ? 'paper' : 'live';
+
+  const block = (message: string): ExecuteResult => {
+    Database.addLog({
+      rawBody: { source, side, symbol, price, quantity, reason },
+      status: 'execution_failed',
+      action: side,
+      symbol,
+      price,
+      quantity,
+      message: `[Signal:${source}] BLOCKED — ${message}`,
+      mode,
+    });
+    return { fired: false, message };
+  };
+
+  // Gate 1: kill switch.
+  if (settings.isKillSwitchActive) return block('kill switch is active');
+
+  // Gate 2: venue health — credentials must exist before we can touch the exchange.
+  if (!settings.bybitApiKey || !settings.bybitApiSecret) {
+    return block('Bybit API credentials are not configured');
+  }
+  const client = new BybitClient({
+    apiKey: settings.bybitApiKey,
+    apiSecret: settings.bybitApiSecret,
+    environment: settings.bybitEnvironment,
+  });
+
+  // Gate 3: no stacking. Fail CLOSED — if we cannot read positions we must not fire,
+  // otherwise a transient API error would let us pile into an existing position.
+  let openPositions: any[];
+  try {
+    openPositions = await client.getPositions(symbol);
+  } catch (e: any) {
+    return block(`could not verify open positions (${e.message || e}) — refusing to fire`);
+  }
+  const live = (openPositions || []).filter(p => Math.abs(Number(p.size || 0)) > 0);
+  if (live.length > 0) {
+    return block(`a position is already open (${live.length}) — not stacking`);
+  }
+  if (Date.now() - lastFireAt < FIRE_LOCK_MS) {
+    return block('an order was just placed — waiting for the exchange to confirm before another');
+  }
+
+  // Gate 4: central risk veto (daily loss, exposure, etc.).
+  const risk = await CentralRiskManager.evaluateTradeRisk({ symbol, side, quantity, price, settings });
+  if (!risk.allowed) return block(risk.reason || 'central risk manager vetoed the trade');
+  const finalQty = risk.modifiedQuantity !== undefined ? risk.modifiedQuantity : quantity;
+
+  // Stops: real ATR drives volatility-adaptive stops; calculateDynamicStops falls back to
+  // honest static-percent stops when no ATR is available (never fabricates volatility).
+  let sl: number | undefined;
+  let tp: number | undefined;
+  let stopsReason = 'Hybrid stops disabled — no SL/TP attached.';
+  if (settings.isHybridStopsActive) {
+    const stops = CentralRiskManager.calculateDynamicStops({
+      price,
+      side,
+      settings,
+      payloadAtr: atr,
+      activeModule: settings.activeRegimeModule === 'range' ? 'range' : 'trend',
+    });
+    sl = stops.stopLossPrice;
+    tp = stops.takeProfitPrice;
+    stopsReason = stops.reason;
+  }
+
+  try {
+    const order = await client.placeOrder({
+      symbol,
+      side: side === 'buy' ? 'Buy' : 'Sell',
+      qty: String(finalQty),
+      orderType: 'Market',
+      stopLoss: sl !== undefined ? String(sl) : undefined,
+      takeProfit: tp !== undefined ? String(tp) : undefined,
+      orderLinkId: `AUTO-${Date.now().toString(36)}`,
+    });
+
+    lastFireAt = Date.now();
+    Database.addLog({
+      rawBody: { source, side, symbol, price, quantity: finalQty, reason },
+      status: 'success',
+      action: side,
+      symbol,
+      price,
+      quantity: finalQty,
+      message: `[Signal:${source}] ${side.toUpperCase()} ${finalQty} ${symbol} sent to Bybit (${settings.bybitEnvironment || 'demo'}, order ${order?.orderId?.slice?.(0, 8) || 'n/a'}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${stopsReason} ${reason}`,
+      mode,
+    });
+    return { fired: true, message: `Placed ${side.toUpperCase()} ${finalQty} ${symbol} on Bybit` };
+  } catch (e: any) {
+    return block(`Bybit rejected the order: ${e.message || e}`);
+  }
+}
+
+/** Route a signal to whichever venue is active. */
+export async function executeSignal(opts: {
+  side: 'buy' | 'sell';
+  symbol: string;
+  price: number;
+  quantity: number;
+  settings: TradingSettings;
+  reason: string;
+  source: 'auto' | 'approved';
+  atr?: number;
+}): Promise<ExecuteResult> {
+  return opts.settings.activeBroker === 'mt5'
+    ? executeMt5Signal(opts)
+    : executeBybitSignal(opts);
+}
+
 // Real ATR(14) from the evaluation klines, for volatility-adaptive stops.
 function atrFromKlines(klines: any[]): number | undefined {
   if (!klines || klines.length < 15) return undefined;
@@ -192,8 +389,7 @@ export async function runSignalEngine(klines: any[], settings: TradingSettings, 
   const ttlMs = candleMinutes * 3 * 60 * 1000;
   Database.expirePendingSignals(ttlMs);
 
-  if (settings.activeBroker !== 'mt5') return;
-  const autoMode = settings.mt5AutoMode || 'off';
+  const autoMode = resolveAutoMode(settings);
   if (autoMode === 'off') return;
   if (!klines || klines.length < 30) return;
 
@@ -207,7 +403,7 @@ export async function runSignalEngine(klines: any[], settings: TradingSettings, 
   if (lastSide === side && candleTime - lastCandleTime < cooldownMs) return;
 
   const price = Number(klines[klines.length - 1].close);
-  const symbol = 'XAUUSD';
+  const symbol = venueSymbol(settings);
   const quantity = settings.defaultOrderSize || 0.1;
   const atr = atrFromKlines(klines);
   const reason = `${signal} from live ${candleMinutes}m evaluation (RSI / %B / VWAP, ADX-gated)`;
@@ -225,7 +421,7 @@ export async function runSignalEngine(klines: any[], settings: TradingSettings, 
   }
 
   // autoMode === 'auto'
-  const result = await executeMt5Signal({ side, symbol, price, quantity, settings, reason, source: 'auto', atr });
+  const result = await executeSignal({ side, symbol, price, quantity, settings, reason, source: 'auto', atr });
   console.log(`[SignalEngine] auto ${side} @ ${price}: ${result.fired ? 'FIRED' : 'blocked'} — ${result.message}`);
   if (result.fired) {
     lastSide = side;
