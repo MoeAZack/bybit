@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useRef, FormEvent } from 'react';
+import { subscribeAuth, loginWithToken, type AuthStatus } from './apiAuth';
 import { 
-  Shield, 
-  Terminal, 
+  Shield,
+  Lock,
+  Terminal,
   Settings, 
   RefreshCw, 
   Copy, 
@@ -193,6 +195,28 @@ interface MT5Account {
 }
 
 export default function App() {
+  // Auth gate. Until a guarded endpoint answers, every value below is React's initial
+  // state — NOT live configuration. Rendering the dashboard in that condition showed
+  // placeholder numbers that read exactly like real settings, so the whole UI is gated
+  // on this. See src/apiAuth.ts.
+  const [authStatus, setAuthStatus] = useState<AuthStatus>('unknown');
+  const [tokenInput, setTokenInput] = useState('');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+
+  useEffect(() => subscribeAuth(setAuthStatus), []);
+
+  const submitToken = async (e: FormEvent) => {
+    e.preventDefault();
+    setAuthBusy(true);
+    setAuthError(null);
+    const err = await loginWithToken(tokenInput);
+    setAuthBusy(false);
+    if (err) { setAuthError(err); return; }
+    setTokenInput('');
+    window.location.reload(); // remount cleanly so every panel refetches with the session
+  };
+
   // Application State
   const [settings, setSettings] = useState<SettingsState>({
     bybitApiKey: '',
@@ -1244,9 +1268,78 @@ export default function App() {
     comment: 'TradingView alert trigger'
   };
 
+  // ── AUTH GATE ──────────────────────────────────────────────────────────────
+  // Never render the terminal without a session. Every figure on the dashboard comes
+  // from /api/*, and those return 401 when locked — leaving React's initial state on
+  // screen. That looked like real configuration (0.1 lot, "BREAKER OFF", $10,000
+  // balance) while the actual live settings were entirely different.
+  if (authStatus !== 'authed') {
+    const checking = authStatus === 'unknown';
+    return (
+      <div className="bg-neutral-950 text-neutral-100 font-sans min-h-screen flex items-center justify-center p-6 border-t-4 border-amber-500">
+        <div className="w-full max-w-md bg-neutral-900 border border-neutral-800 p-8 flex flex-col gap-5">
+          <div className="flex items-center gap-2 text-3xl font-black italic tracking-tighter text-amber-500">
+            <Zap className="fill-amber-500 stroke-none w-7 h-7" />
+            QUANTUM.GOLD
+          </div>
+
+          {checking ? (
+            <p className="text-xs text-neutral-400 font-mono">Checking session…</p>
+          ) : (
+            <>
+              <div className="flex items-start gap-2 border border-amber-500/30 bg-amber-500/5 p-3">
+                <Lock className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                <div className="flex flex-col gap-1">
+                  <span className="text-xs font-black uppercase tracking-wider text-amber-500">Dashboard locked</span>
+                  <span className="text-[11px] text-neutral-400 leading-relaxed">
+                    No live data is shown until you sign in. Balances, positions, risk limits and
+                    performance are only ever rendered from the server — never from placeholder values.
+                  </span>
+                </div>
+              </div>
+
+              <form onSubmit={submitToken} className="flex flex-col gap-3">
+                <label className="text-[10px] font-black uppercase tracking-wider text-neutral-500">
+                  API_AUTH_TOKEN
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  value={tokenInput}
+                  onChange={(e) => { setTokenInput(e.target.value); setAuthError(null); }}
+                  placeholder="paste token"
+                  className="bg-neutral-950 border border-neutral-700 px-3 py-2 font-mono text-sm text-neutral-100 focus:border-amber-500 outline-none"
+                />
+                {authError && (
+                  <span className="text-[11px] text-rose-400 font-mono">{authError}</span>
+                )}
+                <button
+                  type="submit"
+                  disabled={authBusy || !tokenInput.trim()}
+                  className="bg-amber-500 text-black font-black uppercase tracking-wider text-xs py-2.5 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-amber-400 transition-colors"
+                >
+                  {authBusy ? 'Verifying…' : 'Unlock'}
+                </button>
+              </form>
+
+              <p className="text-[10px] text-neutral-600 font-mono leading-relaxed border-t border-neutral-800 pt-3">
+                Retrieve it with:<br />
+                <span className="text-neutral-500 break-all">
+                  gcloud secrets versions access latest --secret=API_AUTH_TOKEN
+                </span>
+                <br /><br />
+                Five failed attempts locks this IP for 15 minutes.
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="bg-neutral-950 text-neutral-100 font-sans min-h-screen flex flex-col overflow-x-hidden border-t-4 border-amber-500 selection:bg-amber-500 selection:text-black">
-      
+
       {/* HEADER SECTION - BOLD & STARK TYPOGRAPHY */}
       <header className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between px-6 py-5 bg-neutral-900 border-b border-neutral-800 gap-4" id="header-container">
         <div className="flex flex-wrap items-center gap-4 lg:gap-6">

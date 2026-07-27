@@ -6,14 +6,38 @@
  * session cookie at /api/auth/login, and the browser attaches that cookie automatically.
  *
  * The token is never persisted client-side: the cookie is the credential, and it is not
- * readable from JS. A prompt therefore appears only when no valid session exists.
+ * readable from JS.
+ *
+ * Auth state is published so the UI can render an explicit locked screen. Previously a
+ * dismissed window.prompt left every /api/* call returning 401 while React kept its
+ * initial state, so the dashboard rendered plausible placeholder numbers (0.1 lot,
+ * "BREAKER OFF", $10,000 balance) that were indistinguishable from live configuration.
+ * On a trading terminal that is a dangerous thing to display.
  */
 
 const original = window.fetch.bind(window);
 
-// Concurrent 401s must share one login, or a dashboard that fires a dozen parallel
-// requests on mount would raise a dozen prompts.
-let loginInFlight: Promise<boolean> | null = null;
+export type AuthStatus = 'unknown' | 'authed' | 'locked';
+
+let status: AuthStatus = 'unknown';
+const listeners = new Set<(s: AuthStatus) => void>();
+
+function setStatus(next: AuthStatus) {
+  if (status === next) return;
+  status = next;
+  listeners.forEach(fn => fn(status));
+}
+
+export function getAuthStatus(): AuthStatus {
+  return status;
+}
+
+/** Subscribe to auth changes. Fires immediately with the current value. */
+export function subscribeAuth(fn: (s: AuthStatus) => void): () => void {
+  listeners.add(fn);
+  fn(status);
+  return () => { listeners.delete(fn); };
+}
 
 function isGuardedApi(url: string): boolean {
   try {
@@ -24,34 +48,64 @@ function isGuardedApi(url: string): boolean {
   }
 }
 
-async function login(): Promise<boolean> {
-  const token = window.prompt('Dashboard locked. Enter API_AUTH_TOKEN:');
-  if (!token) return false;
+/**
+ * Exchange a token for a session cookie.
+ * Returns null on success, or a human-readable error string.
+ */
+export async function loginWithToken(token: string): Promise<string | null> {
+  const trimmed = token.trim();
+  if (!trimmed) return 'Enter the API_AUTH_TOKEN value.';
 
-  const res = await original('/api/auth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token }),
-  });
-
-  if (!res.ok) {
-    window.alert(res.status === 429 ? 'Too many attempts. Wait 15 minutes.' : 'Invalid token.');
-    return false;
+  let res: Response;
+  try {
+    res = await original('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: trimmed }),
+    });
+  } catch {
+    return 'Could not reach the server.';
   }
-  return true;
+
+  if (res.ok) {
+    setStatus('authed');
+    return null;
+  }
+  if (res.status === 429) return 'Too many attempts. Wait 15 minutes before retrying.';
+  if (res.status === 503) return 'Server auth is not configured (API_AUTH_TOKEN is unset).';
+  return 'Invalid token.';
+}
+
+export async function logout(): Promise<void> {
+  try { await original('/api/auth/logout', { method: 'POST' }); } catch { /* ignore */ }
+  setStatus('locked');
+}
+
+/** Probe a guarded endpoint to establish status without waiting for a component fetch. */
+export async function refreshAuthStatus(): Promise<AuthStatus> {
+  try {
+    const res = await original('/api/settings');
+    setStatus(res.status === 401 ? 'locked' : 'authed');
+  } catch {
+    // A network failure is not an auth verdict — leave the status untouched.
+  }
+  return status;
 }
 
 window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   const res = await original(input as RequestInfo, init);
 
-  if (res.status !== 401 || !isGuardedApi(url)) return res;
-
-  if (!loginInFlight) {
-    loginInFlight = login().finally(() => {
-      loginInFlight = null;
-    });
-  }
-
-  return (await loginInFlight) ? original(input as RequestInfo, init) : res;
+  // Lock on any 401 so an expired session takes the dashboard down immediately rather
+  // than leaving stale figures on screen.
+  //
+  // Only 401 is a verdict. A 200 is NOT proof of a session: some /api/* routes are
+  // public (e.g. /api/bridge/status answers 200 unauthenticated), so treating any
+  // success as "authed" would unlock the whole terminal off a single public endpoint.
+  // Positive confirmation comes from refreshAuthStatus() probing a guarded route, or
+  // from a successful loginWithToken().
+  if (isGuardedApi(url) && res.status === 401) setStatus('locked');
+  return res;
 };
+
+void refreshAuthStatus();
