@@ -86,9 +86,11 @@ for s in API_AUTH_TOKEN MT5_BRIDGE_TOKEN GEMINI_API_KEY; do
 done
 
 # --- Persistent storage for db.json ------------------------------------------
-# server/db.ts writes data/db.json with writeFileSync. On Cloud Run that path is
-# per-instance and ephemeral, so settings reset on every cold start and every deploy.
-# Mounting a bucket there makes the same code durable with no changes.
+# server/db.ts writes $DATA_DIR/db.json (default: cwd/data = /app/data in the image).
+# On Cloud Run that path is per-instance and ephemeral, so settings would reset on every
+# cold start and every deploy. Mounting a bucket there makes the same code durable.
+# DATA_DIR is set explicitly on the deploy below so the mount point is stated, not implied
+# (db.ts warns at startup when it detects Cloud Run without an explicit DATA_DIR).
 BUCKET="${BUCKET:-${PROJECT_ID}-moeby-data}"
 if ! gcloud storage buckets describe "gs://${BUCKET}" >/dev/null 2>&1; then
   gcloud storage buckets create "gs://${BUCKET}" \
@@ -131,7 +133,7 @@ env $DEPLOY_ENV "$RUN_DEPLOY" run deploy "$SERVICE" \
   --execution-environment=gen2 \
   --add-volume=name=moeby-data,type=cloud-storage,bucket="$BUCKET" \
   --add-volume-mount=volume=moeby-data,mount-path=/app/data \
-  --set-env-vars=NODE_ENV=production,DISABLE_API_AUTH="${DISABLE_API_AUTH:-false}" \
+  --set-env-vars=NODE_ENV=production,DATA_DIR=/app/data,DISABLE_API_AUTH="${DISABLE_API_AUTH:-false}" \
   --set-secrets=API_AUTH_TOKEN=API_AUTH_TOKEN:latest,MT5_BRIDGE_TOKEN=MT5_BRIDGE_TOKEN:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest
 
 URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
