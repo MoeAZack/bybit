@@ -50,10 +50,39 @@ export class StrategyRouter {
   }
 
   /**
+   * Public entry point. Evaluates the routers, then applies the SHADOW gate.
+   *
+   * A module in shadow mode still computes its signals and they are recorded, but they are
+   * never handed to execution. That lets a new or suspect strategy accumulate a genuine
+   * out-of-sample record on live data before it is trusted with capital — the alternative
+   * (promoting whatever backtested best) is how overfitted strategies reach production.
+   */
+  public static async evaluateSignals(symbol: string, klines: any[]): Promise<RouterSignal | null> {
+    const signal = await this.evaluateSignalsRaw(symbol, klines);
+    if (!signal) return null;
+
+    const mod = this.getModulesStatus().find(m => m.id === signal.module);
+    if (mod?.status === 'SHADOW') {
+      Database.addLog({
+        rawBody: { shadow: true, module: signal.module, side: signal.side, price: signal.price, quantity: signal.quantity },
+        status: 'shadow',
+        action: signal.side.toLowerCase() as 'buy' | 'sell',
+        symbol: signal.symbol,
+        price: signal.price,
+        quantity: signal.quantity,
+        message: `[SHADOW:${signal.module}] ${signal.side} ${signal.quantity} ${signal.symbol} @ ${signal.price} — recorded, NOT executed. SL ${signal.stopLoss.toFixed(2)} / TP ${signal.takeProfit.toFixed(2)}. ${signal.reason}`,
+        mode: Database.get().settings.isPaperTrading ? 'paper' : 'live',
+      });
+      return null;
+    }
+    return signal;
+  }
+
+  /**
    * Evaluates incoming candle data and decides which specialist module should trigger.
    * Enforces the deadband guard: no two conflicting modules fire on the same candle.
    */
-  public static async evaluateSignals(symbol: string, klines: any[]): Promise<RouterSignal | null> {
+  private static async evaluateSignalsRaw(symbol: string, klines: any[]): Promise<RouterSignal | null> {
     if (klines.length < 30) {
       return null;
     }
@@ -242,10 +271,13 @@ export class StrategyRouter {
           kellyFraction = Math.max(0.005, Math.min(0.02, (rawKelly / 4.0)));
         }
       } else {
-        // Fallbacks for zero trades
+        // No trades yet — we know NOTHING about this module's edge. Previously this claimed
+        // a baseline expectancy of +0.20R (+0.35R for reversion), an invented edge that fed
+        // straight into calculateFractionalKellySize and therefore into real position sizes.
+        // Report zero and size at the floor until the module has actually earned a record.
         winRate = 0;
-        expectancyR = id === 'reversion' ? 0.35 : 0.20; // baseline EAs
-        kellyFraction = 0.01; // 1% risk standard
+        expectancyR = 0;
+        kellyFraction = 0.005; // minimum risk unit, not a guess at an edge
       }
 
       // Check toggles (enable states)
@@ -259,14 +291,19 @@ export class StrategyRouter {
         enabled = true;
       }
 
+      // SHADOW: the module evaluates and logs its signals but never executes them, so a new
+      // or suspect strategy can build a real out-of-sample record on live data before it is
+      // trusted with capital. Shadow wins over enabled.
+      const isShadow = (db.settings.shadowModules || []).includes(id);
+
       return {
         name,
         id,
-        enabled,
+        enabled: enabled && !isShadow,
         expectancyR: Math.round(expectancyR * 100) / 100,
         winRate: Math.round(winRate * 10) / 10,
         kellyFraction: Math.round(kellyFraction * 1000) / 10, // show as % of balance (e.g. 1.2%)
-        status: enabled ? 'ACTIVE' : 'DISABLED',
+        status: isShadow ? 'SHADOW' : enabled ? 'ACTIVE' : 'DISABLED',
       };
     };
 

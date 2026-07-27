@@ -17,6 +17,7 @@ import { BasketManager } from './basketManager.js';
 import { CentralRiskManager } from './risk.js';
 import { enqueueMt5Command, getBridgeStatus } from './mt5bridge.js';
 import { BybitClient } from './bybit.js';
+import { ExecutionShortfall } from './executionShortfall.js';
 import { calculateATR } from './indicators.js';
 
 /** Resolve the automation mode, tolerating the legacy MT5-only setting name. */
@@ -337,6 +338,29 @@ export async function executeBybitSignal(opts: {
     });
 
     lastFireAt = Date.now();
+
+    // Measure the REAL fill: compare the signal price against the average price the
+    // exchange actually filled at. Best-effort — a failure here must never affect the trade.
+    let fillNote = '';
+    try {
+      await new Promise(r => setTimeout(r, 1200)); // let the market order settle
+      const after = await client.getPositions(symbol);
+      const live = (after || []).find(p => Math.abs(Number(p.size || 0)) > 0);
+      const avg = Number(live?.avgPrice);
+      if (Number.isFinite(avg) && avg > 0) {
+        const shf = ExecutionShortfall.recordFill({
+          symbol,
+          module: settings.activeRegimeModule === 'range' ? 'range' : 'trend',
+          side: side === 'buy' ? 'BUY' : 'SELL',
+          signalPrice: price,
+          fillPrice: avg,
+          quantity: finalQty,
+          executionType: 'MarketEscalation_Taker',
+        });
+        if (shf) fillNote = ` Filled @ ${avg} (shortfall ${shf.shortfallTicks} ticks / $${shf.shortfallUsd}).`;
+      }
+    } catch { /* measurement is best-effort */ }
+
     Database.addLog({
       rawBody: { source, side, symbol, price, quantity: finalQty, reason },
       status: 'success',
@@ -344,7 +368,7 @@ export async function executeBybitSignal(opts: {
       symbol,
       price,
       quantity: finalQty,
-      message: `[Signal:${source}] ${side.toUpperCase()} ${finalQty} ${symbol} sent to Bybit (${settings.bybitEnvironment || 'demo'}, order ${order?.orderId?.slice?.(0, 8) || 'n/a'}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${stopsReason} ${reason}`,
+      message: `[Signal:${source}] ${side.toUpperCase()} ${finalQty} ${symbol} sent to Bybit (${settings.bybitEnvironment || 'demo'}, order ${order?.orderId?.slice?.(0, 8) || 'n/a'}). SL ${sl ?? '—'} / TP ${tp ?? '—'}.${fillNote} ${stopsReason} ${reason}`,
       mode,
     });
     return { fired: true, message: `Placed ${side.toUpperCase()} ${finalQty} ${symbol} on Bybit` };

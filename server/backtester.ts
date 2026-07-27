@@ -19,6 +19,33 @@ async function fetchKlinesCached(client: BybitClient, symbol: string, interval: 
   return klines;
 }
 
+/**
+ * Deterministic PRNG (mulberry32).
+ *
+ * The backtest models probabilistic events (post-only fill failure). With Math.random()
+ * the same config produced different results on every run, which made the optimizer partly
+ * a random number generator: you could not tell whether a parameter change helped or simply
+ * got a luckier draw. Seeding makes a run reproducible and sweeps comparable.
+ */
+function makeRng(seed: number) {
+  let a = seed >>> 0;
+  return function rng(): number {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Stable seed from the swept parameters, so each config is reproducible but not identical. */
+function seedFromParams(p: StrategyParams): number {
+  if (typeof p.seed === 'number') return p.seed;
+  const s = JSON.stringify([p.fastEma, p.slowEma, p.rsiPeriod, p.atrMultiplierSL, p.atrMultiplierTP, p.orderType, p.symbol]);
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
 function calculateEMA(prices: number[], period: number): number[] {
   const ema: number[] = [];
   if (prices.length === 0) return ema;
@@ -193,6 +220,7 @@ export interface BacktestResult {
   marRatio: number; // Annualized CAGR / maxDrawdown
   totalFeesPaid: number;
   totalSlippagePaid: number;
+  totalFundingPaid?: number;
   rejectedTradesCount: number;
   monteCarloMaxDrawdown95: number;
   rollingExpectancyAlert: boolean; // edge decay warning
@@ -226,9 +254,18 @@ export interface StrategyParams {
   atrPeriod: number;
   atrMultiplierSL: number;
   atrMultiplierTP: number;
-  feePercent: number; // e.g. 0.055 for 0.055%
+  feePercent: number; // taker fee, e.g. 0.055 for 0.055%
+  /** Maker fee percent for post-only fills, e.g. 0.02 for 0.02%. Defaults to 0.02. */
+  makerFeePercent?: number;
   slippageTicks: number; // e.g. 1 tick = $0.05
   walkForward: 'none' | 'fit_jan_mar' | 'val_apr_jun';
+  /** Explicit window in epoch ms. Overrides walkForward when both are supplied. */
+  startMs?: number;
+  endMs?: number;
+  /** Seed for the deterministic PRNG. Omit to derive one from the swept parameters. */
+  seed?: number;
+  /** Annualised funding cost estimate, percent per 8h interval (Bybit charges 3x/day). */
+  fundingRatePercentPer8h?: number;
   // Upgraded parameters
   isRegimeFilterActive?: boolean;
   adxThreshold?: number;
@@ -258,11 +295,19 @@ export class Backtester {
   }
 
   public static async run(params: StrategyParams): Promise<BacktestResult> {
-    // Determine backtest time window
+    // Deterministic RNG for this run — see makeRng().
+    const rng = makeRng(seedFromParams(params));
+    let tradeSeq = 0;
+
+    // Determine backtest time window. An explicit startMs/endMs wins (used by the
+    // optimizer's walk-forward folds); otherwise fall back to the named windows.
     let startDate = new Date('2026-01-01T00:00:00Z');
     let endDate = new Date('2026-06-30T23:59:59Z');
 
-    if (params.walkForward === 'fit_jan_mar') {
+    if (typeof params.startMs === 'number' && typeof params.endMs === 'number') {
+      startDate = new Date(params.startMs);
+      endDate = new Date(params.endMs);
+    } else if (params.walkForward === 'fit_jan_mar') {
       startDate = new Date('2026-01-01T00:00:00Z');
       endDate = new Date('2026-03-31T23:59:59Z');
     } else if (params.walkForward === 'val_apr_jun') {
@@ -358,6 +403,7 @@ export class Backtester {
     let rejectedTradesCount = 0;
     let totalFeesPaid = 0;
     let totalSlippagePaid = 0;
+    let totalFundingPaid = 0;
 
     // Track daily balance growth for plotting
     const dailyBalanceMap: { [dateStr: string]: number } = {};
@@ -367,6 +413,7 @@ export class Backtester {
     let startOfDayBalance = balance;
     let dailyLossThisDay = 0;
     let coolingOffUntil: Date | null = null;
+    let coolOffLatched = false;
 
     for (let i = 1; i < klines.length; i++) {
       const prev = klines[i - 1];
@@ -420,7 +467,7 @@ export class Backtester {
         const riskAmountR = initialDollarRisk > 0 ? (finalPnL / initialDollarRisk) : 0;
 
         trades.push({
-          id: 'backtest-' + Math.random().toString(36).substr(2, 9),
+          id: 'backtest-' + (++tradeSeq).toString(36).padStart(4, '0'),
           type: pos.type,
           entryPrice: pos.entryPrice,
           exitPrice,
@@ -485,7 +532,7 @@ export class Backtester {
             const riskAmountR = initialDollarRisk > 0 ? (finalPnL / initialDollarRisk) : 0;
 
             trades.push({
-              id: 'backtest-' + Math.random().toString(36).substr(2, 9),
+              id: 'backtest-' + (++tradeSeq).toString(36).padStart(4, '0'),
               type: pos.type,
               entryPrice: pos.entryPrice,
               exitPrice,
@@ -558,13 +605,25 @@ export class Backtester {
           const mult = getContractMultiplier(params.symbol);
           const grossPnL = sideMultiplier * priceDiff * pos.quantity * mult;
 
-          // Fees modeling (Maker vs Taker)
+          // Fees modeling (Maker vs Taker).
+          // NOTE: both branches must divide by 100. The post-only branch previously used a
+          // raw 0.02 — i.e. 2% per side, 4% round trip, ~100x Bybit's real 0.02% maker fee —
+          // which made every post-only backtest look catastrophically unprofitable.
           const entryValue = pos.entryPrice * pos.quantity * mult;
           const exitValue = exitPrice * pos.quantity * mult;
-          const rate = params.orderType === 'LIMIT_POST_ONLY' ? 0.02 : (params.feePercent / 100);
+          const rate = params.orderType === 'LIMIT_POST_ONLY'
+            ? (params.makerFeePercent ?? 0.02) / 100
+            : params.feePercent / 100;
           const totalFees = (entryValue + exitValue) * rate;
 
-          const finalPnL = grossPnL - totalFees;
+          // Perp funding: charged every 8h on the position notional. Omitting it flatters
+          // any strategy that holds positions for hours.
+          const fundingPer8h = (params.fundingRatePercentPer8h ?? 0.01) / 100;
+          const hoursHeld = (curr.time.getTime() - pos.entryTime.getTime()) / 3600000;
+          const fundingCost = Math.floor(hoursHeld / 8) * entryValue * fundingPer8h;
+          totalFundingPaid += fundingCost;
+
+          const finalPnL = grossPnL - totalFees - fundingCost;
           balance += finalPnL;
           totalFeesPaid += totalFees;
 
@@ -585,7 +644,7 @@ export class Backtester {
           const riskAmountR = initialDollarRisk > 0 ? (finalPnL / initialDollarRisk) : 0;
 
           trades.push({
-            id: 'backtest-' + Math.random().toString(36).substr(2, 9),
+            id: 'backtest-' + (++tradeSeq).toString(36).padStart(4, '0'),
             type: pos.type,
             entryPrice: pos.entryPrice,
             exitPrice,
@@ -618,9 +677,18 @@ export class Backtester {
         // Daily loss cap block check (2% of starting day balance)
         const isDailyLossLimitExceeded = params.isEquityThrottleActive && dailyLossThisDay >= (startOfDayBalance * 0.02);
 
-        // 48h Cooling off period block check (if drawdown hit 6% or more)
-        if (params.isEquityThrottleActive && maxDrawdown >= 6.0 && !coolingOffUntil) {
+        // 48h cooling-off after a 6% drawdown.
+        //
+        // This must key off the CURRENT drawdown, not maxDrawdown. maxDrawdown is a running
+        // peak that never decreases, so the old condition stayed true forever: the cooldown
+        // expired, immediately re-armed on the next bar, and the strategy stopped trading for
+        // the remainder of the backtest. The latch clears once equity recovers to within 3%
+        // of its peak, so each distinct drawdown event triggers one cooling-off.
+        const currentDd = maxBalance > 0 ? ((maxBalance - balance) / maxBalance) * 100 : 0;
+        if (coolOffLatched && currentDd < 3.0) coolOffLatched = false;
+        if (params.isEquityThrottleActive && currentDd >= 6.0 && !coolingOffUntil && !coolOffLatched) {
           coolingOffUntil = new Date(curr.time.getTime() + 48 * 60 * 60 * 1000);
+          coolOffLatched = true;
         }
 
         const isCoolingOffActive = coolingOffUntil && curr.time < coolingOffUntil;
@@ -641,7 +709,7 @@ export class Backtester {
             rejectedTradesCount++;
           } else {
             // Limit order fill chance modeling (15% failed post-only fill chance)
-            if (params.orderType === 'LIMIT_POST_ONLY' && Math.random() < 0.15) {
+            if (params.orderType === 'LIMIT_POST_ONLY' && rng() < 0.15) {
               rejectedTradesCount++;
             } else {
               // Volatility-Scaled Sizing logic: risk 1% of equity per trade
@@ -650,9 +718,14 @@ export class Backtester {
 
               let quantity = 0.1; // Default
               if (params.isVolatilitySizingActive) {
+                // Risk = stopDistance * qty * contractMultiplier, so qty = risk / (dist * mult).
+                // This previously divided by (slDistance * 10) — a magic 10 that contradicted
+                // the multiplier used in the PnL maths below, making every sized position 10x
+                // too small and understating both returns and drawdown by the same factor.
                 const targetRiskDollars = balance * ((params.riskPercent || 1.0) / 100);
-                quantity = targetRiskDollars / (slDistance * 10);
-                quantity = Math.max(0.01, Math.min(2.0, Math.round(quantity * 100) / 100));
+                const sizingMult = getContractMultiplier(params.symbol || 'XAUUSDT');
+                quantity = targetRiskDollars / (slDistance * sizingMult);
+                quantity = Math.max(0.001, Math.min(2.0, Math.round(quantity * 1000) / 1000));
               }
 
               // Apply equity curve throttle: cut size by 50% after 2 consecutive losses
@@ -810,6 +883,7 @@ export class Backtester {
       expectancyR,
       marRatio,
       totalFeesPaid,
+      totalFundingPaid: Math.round(totalFundingPaid * 100) / 100,
       totalSlippagePaid,
       rejectedTradesCount,
       monteCarloMaxDrawdown95,

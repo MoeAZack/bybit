@@ -5,7 +5,7 @@ export interface WebhookLog {
   id: string;
   timestamp: string;
   rawBody: any;
-  status: 'success' | 'auth_failed' | 'execution_failed' | 'ignored';
+  status: 'success' | 'auth_failed' | 'execution_failed' | 'ignored' | 'shadow';
   action: 'buy' | 'sell' | 'close' | 'none';
   symbol: string;
   price: number;
@@ -90,6 +90,8 @@ export interface TradingSettings {
   isRolloverFilterActive: boolean;
   reversion: ReversionSettings;
   // MT5 Prop-Firm settings
+  /** Specialist module ids running in SHADOW mode: they log signals but never execute. */
+  shadowModules?: string[];
   activeBroker: 'bybit' | 'mt5';
   // Which MT5 credential profile the venue switch targets. Distinguishes the two mt5
   // positions ("MT5 Demo" vs "Funded") without changing the routing itself.
@@ -250,6 +252,7 @@ const defaultDb: DbSchema = {
       timeStopBars: 16,
       maxSpreadUsd: 0.60,
     },
+    shadowModules: [],
     activeBroker: 'bybit',
     mt5AccountType: 'demo',
     mt5AutoMode: 'off',
