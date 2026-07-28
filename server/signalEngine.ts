@@ -12,7 +12,7 @@
  * Both enforce the identical gate sequence: kill switch -> venue health -> no-stacking ->
  * fire lock -> central risk veto -> ATR stops.
  */
-import { Database, TradingSettings } from './db.js';
+import { Database, TradingSettings, toVenueVolume } from './db.js';
 import { BasketManager } from './basketManager.js';
 import { CentralRiskManager } from './risk.js';
 import { enqueueMt5Command, getBridgeStatus } from './mt5bridge.js';
@@ -218,10 +218,17 @@ export async function executeMt5Signal(opts: {
     tp = stops.takeProfitPrice;
   }
 
+  // finalQty is in OUNCES. MT5 order volume is in LOTS (1 lot = 100 oz for XAUUSD), so it
+  // must be converted or the position is 100x the intended size.
+  const lots = toVenueVolume(finalQty, symbol, 'mt5');
+  if (!(lots > 0)) {
+    return block(`computed size ${finalQty} oz rounds to ${lots} lots — below the broker's minimum, refusing to send`);
+  }
+
   const cmd = enqueueMt5Command({
     action: side === 'buy' ? 'BUY' : 'SELL',
     symbol,
-    volume: finalQty,
+    volume: lots,
     sl,
     tp,
     price,
@@ -230,13 +237,13 @@ export async function executeMt5Signal(opts: {
 
   lastFireAt = Date.now();
   Database.addLog({
-    rawBody: { source, side, symbol, price, quantity: finalQty, reason },
+    rawBody: { source, side, symbol, price, quantity: finalQty, lots, reason },
     status: 'success',
     action: side,
     symbol,
     price,
     quantity: finalQty,
-    message: `[Signal:${source}] ${cmd.action} ${finalQty} ${symbol} queued (id ${cmd.id.slice(0, 8)}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${reason}`,
+    message: `[Signal:${source}] ${cmd.action} ${lots} lots (${finalQty} oz) ${symbol} queued (id ${cmd.id.slice(0, 8)}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${reason}`,
     mode,
   });
 

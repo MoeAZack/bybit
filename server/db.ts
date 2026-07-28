@@ -198,6 +198,39 @@ export function getContractMultiplier(symbol: string): number {
   return 1; // default multiplier
 }
 
+/**
+ * Ounces of gold represented by ONE unit of order volume on the given venue.
+ *
+ * This is the single most dangerous difference between the two venues and it is silent:
+ *   Bybit XAUUSDT — volume is denominated in contracts, 1 contract = 1 oz
+ *   MT5   XAUUSD  — volume is denominated in LOTS,      1 lot      = 100 oz
+ *
+ * All internal sizing is computed in OUNCES (risk / stop-distance). Sending that number
+ * straight to MT5 as a lot size overstates the position 100x: an intended 0.05 oz
+ * (~$205 notional) becomes 0.05 lots = 5 oz (~$20,450). The EA's InpMaxVolume clamp caps
+ * the blast radius at 0.10 lots but does not correct the unit — it would still be 10 oz.
+ *
+ * Use toVenueVolume() to convert before sending an order.
+ */
+export function ouncesPerVolumeUnit(symbol: string, broker: 'bybit' | 'mt5'): number {
+  const s = (symbol || '').toUpperCase().trim();
+  if (broker === 'mt5') {
+    // Standard MT5 metals contract. Brokers can differ (some quote 10 oz "mini" lots), so
+    // this is the documented default — confirm SYMBOL_TRADE_CONTRACT_SIZE on your broker.
+    if (s.startsWith('XAU') || s === 'GOLD') return 100;
+    return 1;
+  }
+  return 1; // Bybit linear: 1 contract = 1 oz
+}
+
+/** Convert an ounce-denominated size into the venue's native order volume. */
+export function toVenueVolume(ounces: number, symbol: string, broker: 'bybit' | 'mt5'): number {
+  const per = ouncesPerVolumeUnit(symbol, broker);
+  const vol = ounces / per;
+  // MT5 lots are quoted to 2dp; Bybit XAUUSDT steps at 0.001.
+  return broker === 'mt5' ? Math.round(vol * 100) / 100 : Math.round(vol * 1000) / 1000;
+}
+
 const defaultDb: DbSchema = {
   settings: {
     bybitApiKey: '',

@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
-import { Database } from './server/db.js';
+import { Database, toVenueVolume } from './server/db.js';
 import { BybitClient, normalizeKlines } from './server/bybit.js';
 import { MT5Client } from './server/mt5.js';
 import { Backtester } from './server/backtester.js';
@@ -1476,10 +1476,22 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           tp = stops.takeProfitPrice;
         }
 
+        // finalQuantity is in OUNCES; MT5 volume is in LOTS (1 lot = 100 oz on XAUUSD).
+        // Sending ounces as lots would open a position 100x the intended size.
+        const mt5Lots = toVenueVolume(finalQuantity, mt5Symbol, 'mt5');
+        if (!(mt5Lots > 0) && action !== 'close') {
+          const errMsg = `[Bridge] computed size ${finalQuantity} oz rounds to ${mt5Lots} lots — below the broker minimum. Order NOT queued.`;
+          const log = Database.addLog({
+            rawBody: payload, status: 'execution_failed', action, symbol: mt5Symbol,
+            price, quantity: finalQuantity, message: errMsg, mode,
+          });
+          return res.status(400).json({ error: errMsg, logId: log.id });
+        }
+
         const cmd = enqueueMt5Command({
           action: action === 'buy' ? 'BUY' : action === 'sell' ? 'SELL' : action === 'close' ? 'CLOSE' : 'CLOSE',
           symbol: mt5Symbol,
-          volume: finalQuantity,
+          volume: mt5Lots,
           sl,
           tp,
           price,
@@ -1494,7 +1506,7 @@ app.post('/api/tradingview-webhook', async (req, res) => {
           symbol: mt5Symbol,
           price,
           quantity: finalQuantity,
-          message: `[Bridge] ${cmd.action} ${finalQuantity} ${mt5Symbol} queued (id ${cmd.id.slice(0, 8)}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${riskReason}`,
+          message: `[Bridge] ${cmd.action} ${mt5Lots} lots (${finalQuantity} oz) ${mt5Symbol} queued (id ${cmd.id.slice(0, 8)}). SL ${sl ?? '—'} / TP ${tp ?? '—'}. ${riskReason}`,
           mode,
         });
         return res.json({ success: true, mode, queued: true, commandId: cmd.id, logId: log.id });
