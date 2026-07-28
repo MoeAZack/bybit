@@ -21,8 +21,8 @@
  * Intrabar, the stop is checked BEFORE the target, so an ambiguous candle resolves
  * pessimistically.
  */
-import { BybitClient } from '../bybit.js';
 import { getContractMultiplier } from '../db.js';
+import { getDataProvider } from '../data/index.js';
 
 export interface SessionParams {
   symbol: string;
@@ -78,20 +78,11 @@ export interface SessionResult {
 
 type Bar = { t: number; o: number; h: number; l: number; c: number };
 
-const _cache = new Map<string, any[]>();
-
 async function fetchBars(symbol: string, interval: string, startMs: number, endMs: number): Promise<Bar[]> {
-  const key = `${symbol}:${interval}:${startMs}:${endMs}`;
-  let raw = _cache.get(key);
-  if (!raw) {
-    const client = new BybitClient({ apiKey: '', apiSecret: '' });
-    raw = await client.getKlinesRange({ symbol, interval, startMs, endMs, maxCandles: 20000 });
-    _cache.set(key, raw);
-  }
-  return raw
-    .map((k: any) => ({ t: Number(k[0]), o: +k[1], h: +k[2], l: +k[3], c: +k[4] }))
-    .filter(b => Number.isFinite(b.c) && Number.isFinite(b.h) && Number.isFinite(b.l))
-    .sort((a, b) => a.t - b.t);
+  // Same provider abstraction the main backtester uses, so this strategy can be validated
+  // on years of MT5 broker history rather than Bybit's ~5-month XAUUSDT record.
+  const bars = await getDataProvider().getBars(symbol, Number(interval), startMs, endMs);
+  return bars.map(b => ({ t: b.time, o: b.open, h: b.high, l: b.low, c: b.close }));
 }
 
 /** Wilder ATR aligned to the bar array (leading entries use the running average). */

@@ -2,6 +2,7 @@ import { ClosedTrade, getContractMultiplier } from './db.js';
 import { BybitClient } from './bybit.js';
 import { calculateBollingerBands, calculateSessionVWAP } from './indicators.js';
 import { isWithinTier1Blackout } from './newsCalendar.js';
+import { getDataProvider } from './data/index.js';
 
 // Raw-kline cache. A single backtest fetches months of history (~40 paginated calls); an
 // optimizer sweep runs dozens of backtests over the SAME window, so without caching it
@@ -10,13 +11,12 @@ import { isWithinTier1Blackout } from './newsCalendar.js';
 const _klineCache = new Map<string, { at: number; klines: any[] }>();
 const KLINE_CACHE_TTL_MS = 5 * 60 * 1000;
 
-async function fetchKlinesCached(client: BybitClient, symbol: string, interval: string, startMs: number, endMs: number): Promise<any[]> {
-  const key = `${symbol}:${interval}:${startMs}:${endMs}`;
-  const hit = _klineCache.get(key);
-  if (hit && Date.now() - hit.at < KLINE_CACHE_TTL_MS) return hit.klines;
-  const klines = await client.getKlinesRange({ symbol, interval, startMs, endMs, maxCandles: 20000 });
-  _klineCache.set(key, { at: Date.now(), klines });
-  return klines;
+async function fetchKlinesCached(_client: BybitClient, symbol: string, interval: string, startMs: number, endMs: number): Promise<any[]> {
+  // Routed through the data-provider abstraction so the same engine can run on an MT5
+  // broker export (years of history) instead of only Bybit's ~5-month XAUUSDT record.
+  // Returns Bybit's raw array shape for compatibility with the existing call sites.
+  const bars = await getDataProvider().getBars(symbol, Number(interval), startMs, endMs);
+  return bars.map(b => [b.time, b.open, b.high, b.low, b.close, b.volume]);
 }
 
 /**
