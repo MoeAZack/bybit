@@ -6,10 +6,11 @@
  * hour while still looking plausible. Run this first.
  *
  *   npx tsx server/inspect-data.ts                                  # Bybit (default)
- *   BACKTEST_CSV=./data/XAUUSD_M15.csv BACKTEST_CSV_TZ_OFFSET_MINS=180 \
- *     npx tsx server/inspect-data.ts --interval 15
+ *   BACKTEST_CSV=./data/GOLD_15.csv npx tsx server/inspect-data.ts          # TradingView (self-describing)
+ *   BACKTEST_CSV=./data/XAUUSD_M15.csv BACKTEST_CSV_TZ=mt5-eet \
+ *     npx tsx server/inspect-data.ts --interval 15                          # MT5 (needs a zone)
  */
-import { getDataProvider, assessBars } from './data/index.js';
+import { getDataProvider, assessBars, CsvDataProvider } from './data/index.js';
 
 const argOf = (n: string, d?: string) => {
   const i = process.argv.indexOf(`--${n}`);
