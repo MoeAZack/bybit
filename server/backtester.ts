@@ -262,6 +262,8 @@ export interface StrategyParams {
   /** Explicit window in epoch ms. Overrides walkForward when both are supplied. */
   startMs?: number;
   endMs?: number;
+  /** Bar interval in minutes (15 default; 60/240/1440 for H1/H4/D1). */
+  intervalMins?: number;
   /** Seed for the deterministic PRNG. Omit to derive one from the swept parameters. */
   seed?: number;
   /** Annualised funding cost estimate, percent per 8h interval (Bybit charges 3x/day). */
@@ -315,7 +317,9 @@ export class Backtester {
       endDate = new Date('2026-06-30T23:59:59Z');
     }
 
-    const timeframeMins = 15; // standard TrendForge 15-minute chart
+    // Bar interval. Defaults to 15m for backwards compatibility; set intervalMins to run
+    // the same strategy on 1H/4H/1D data (e.g. a 10-year daily export).
+    const timeframeMins = params.intervalMins ?? 15;
     let klines: {
       time: Date;
       open: number;
@@ -334,7 +338,7 @@ export class Backtester {
       const client = new BybitClient({ apiKey: '', apiSecret: '' });
       const symbol = params.symbol || 'XAUUSDT';
       // Fetch the actual walk-forward window (paginated), cached so sweeps reuse the data.
-      const rawKlines = await fetchKlinesCached(client, symbol, '15', startDate.getTime(), endDate.getTime());
+      const rawKlines = await fetchKlinesCached(client, symbol, String(timeframeMins), startDate.getTime(), endDate.getTime());
 
       if (rawKlines && rawKlines.length > 28) {
         // getKlinesRange already returns chronological ascending order.
