@@ -20,6 +20,22 @@ async function fetchKlinesCached(_client: BybitClient, symbol: string, interval:
 }
 
 /**
+ * Per-side slippage in PRICE units for this instrument.
+ *
+ * `slippageTicks * 0.05` was hardcoded — 0.05 is a GOLD tick. Applied to Yen futures
+ * (price ~0.0098) that is 510% of the price, which produced negative short entry prices
+ * and expectancy readings of -477R. Fixed ticks only work on one instrument; basis points
+ * of price scale correctly across all of them.
+ *
+ * slippageBps takes precedence when supplied. Otherwise the legacy tick behaviour is kept
+ * so existing single-instrument gold results stay reproducible.
+ */
+function slippagePerSide(params: StrategyParams, price: number): number {
+  if (typeof params.slippageBps === 'number') return (params.slippageBps / 10000) * Math.abs(price);
+  return params.slippageTicks * (params.tickSize ?? 0.05);
+}
+
+/**
  * Deterministic PRNG (mulberry32).
  *
  * The backtest models probabilistic events (post-only fill failure). With Math.random()
@@ -262,6 +278,12 @@ export interface StrategyParams {
   /** Explicit window in epoch ms. Overrides walkForward when both are supplied. */
   startMs?: number;
   endMs?: number;
+  /** Per-side slippage in basis points of price. Scale-correct; preferred over ticks. */
+  slippageBps?: number;
+  /** Instrument tick size, used only with the legacy slippageTicks path. */
+  tickSize?: number;
+  /** Notional cap as a multiple of balance. Scale-invariant position limit. */
+  maxLeverage?: number;
   /** Bar interval in minutes (15 default; 60/240/1440 for H1/H4/D1). */
   intervalMins?: number;
   /** Seed for the deterministic PRNG. Omit to derive one from the swept parameters. */
@@ -594,7 +616,7 @@ export class Backtester {
           // Model slippage (only applies if closing via SL or TP market order)
           let slippageAmount = 0;
           if (closeReason === 'SL' || closeReason === 'TP' || params.orderType !== 'LIMIT_POST_ONLY') {
-            slippageAmount = (params.slippageTicks * 0.05); // $0.05 per tick slippage
+            slippageAmount = slippagePerSide(params, exitPrice);
             if (pos.type === 'LONG') {
               exitPrice -= slippageAmount;
             } else {
@@ -729,7 +751,16 @@ export class Backtester {
                 const targetRiskDollars = balance * ((params.riskPercent || 1.0) / 100);
                 const sizingMult = getContractMultiplier(params.symbol || 'XAUUSDT');
                 quantity = targetRiskDollars / (slDistance * sizingMult);
-                quantity = Math.max(0.001, Math.min(2.0, Math.round(quantity * 1000) / 1000));
+
+                // Cap by NOTIONAL, not by a raw contract count. A fixed "max 2.0 contracts"
+                // is only meaningful for an instrument priced like gold: Yen futures trade
+                // near 0.0061 with a ~0.000022 daily range, so risking 1% needs ~2.3M units.
+                // Clamping that to 2.0 drove actual risk to ~$0.0001 and made the reported
+                // R-multiple explode to -477R — a sizing artefact, not a trading result.
+                const maxNotional = balance * (params.maxLeverage ?? 10);
+                const maxQtyByNotional = curr.close > 0 ? maxNotional / (curr.close * sizingMult) : quantity;
+                quantity = Math.min(quantity, maxQtyByNotional);
+                quantity = Math.max(1e-6, Math.round(quantity * 1000) / 1000);
               }
 
               // Apply equity curve throttle: cut size by 50% after 2 consecutive losses
@@ -739,7 +770,7 @@ export class Backtester {
 
               if (isGoldenCross && curr.rsi < params.rsiOverbought) {
                 // Long
-                let slippageAmount = (params.orderType !== 'LIMIT_POST_ONLY') ? (params.slippageTicks * 0.05) : 0;
+                let slippageAmount = (params.orderType !== 'LIMIT_POST_ONLY') ? slippagePerSide(params, curr.close) : 0;
                 const entryPrice = curr.close + slippageAmount;
                 totalSlippagePaid += slippageAmount;
 
@@ -757,7 +788,7 @@ export class Backtester {
                 };
               } else if (isDeathCross && curr.rsi > params.rsiOversold) {
                 // Short
-                let slippageAmount = (params.orderType !== 'LIMIT_POST_ONLY') ? (params.slippageTicks * 0.05) : 0;
+                let slippageAmount = (params.orderType !== 'LIMIT_POST_ONLY') ? slippagePerSide(params, curr.close) : 0;
                 const entryPrice = curr.close - slippageAmount;
                 totalSlippagePaid += slippageAmount;
 
